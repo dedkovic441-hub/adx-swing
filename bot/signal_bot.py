@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Alert-only Binance Spot bot for coin-chart v7 ATR-adaptive swing BUY/SELL signals."""
+"""Alert-only Binance USD-M Futures bot for coin-chart v7 ATR-adaptive swing BUY/SELL signals."""
 from __future__ import annotations
 
 import argparse
@@ -26,20 +26,23 @@ from swing import INTERVAL_MS, detect_swing_signals  # noqa: E402
 JAKARTA = ZoneInfo("Asia/Jakarta")
 CHART_DEFAULT = "https://dedkovic441-hub.github.io/coin-chart/"
 
+# Same USD-M Futures hosts as index.html. Public market data only.
 REST_BASES = [
-    "https://data-api.binance.vision",
-    "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://api-gcp.binance.com",
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+    "https://fapi4.binance.com",
 ]
+REST_PREFIX = "/fapi/v1"
 REST_TIMEOUT = 4
 REST_TIMEOUT_BULKY = 8
+# fapi.binance.com sits behind CloudFront and sometimes answers HTTP 403
+# for a moment, then accepts the same request. Retry that host before failover.
+REST_403_ATTEMPTS = 3
+REST_403_BACKOFF_SEC = 0.3
 WS_HOSTS = [
-    "wss://data-stream.binance.vision:443",
-    "wss://stream.binance.com:443",
-    "wss://stream.binance.com:9443",
+    "wss://fstream.binance.com",
 ]
 WS_CONNECT_TIMEOUT = 5
 
@@ -82,6 +85,41 @@ def signal_key(symbol: str, tf: str, sig: dict, provisional: bool = False) -> st
     if provisional or sig.get("provisional"):
         return f"{symbol}:{tf}:prov:{sig.get('time')}:{sig.get('price')}:{sig.get('id')}"
     return f"{symbol}:{tf}:{sig.get('time')}:{sig.get('id')}"
+
+
+def combined_stream_url(host: str, streams: list[str]) -> str:
+    return host.rstrip("/") + "/stream?streams=" + "/".join(streams)
+
+
+def cloudfront_403_backoff(attempt: int) -> float:
+    """Short delay before repeating a CloudFront HTTP 403. attempt is 0-based."""
+    return REST_403_BACKOFF_SEC * (attempt + 1)
+
+
+def _response_text(response, limit: int = 240) -> str:
+    try:
+        return (response.text or "")[:limit]
+    except Exception:
+        return ""
+
+
+def _is_restricted(response) -> bool:
+    if getattr(response, "status_code", None) == 451:
+        return True
+    return "restricted location" in _response_text(response).lower()
+
+
+def _is_cloudfront_403(response) -> bool:
+    if getattr(response, "status_code", None) != 403:
+        return False
+    server = ""
+    headers = getattr(response, "headers", None) or {}
+    try:
+        server = str(headers.get("Server") or headers.get("server") or "")
+    except Exception:
+        server = ""
+    blob = (server + " " + _response_text(response, 500)).lower()
+    return "cloudfront" in blob or "request could not be satisfied" in blob
 
 
 def chart_link(base: str, symbol: str, tf: str) -> str:
@@ -205,8 +243,11 @@ class RestClient:
             self.bases.remove(remembered)
             self.bases.insert(0, remembered)
         self.current: Optional[str] = remembered if remembered in REST_BASES else None
+        self.saw_restricted = False
+        self._sleep = time.sleep
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "coin-chart-signal-bot/7.1"
+        self.session.headers["Accept"] = "application/json"
 
     def get(self, path: str, timeout: Optional[float] = None, bulky: bool = False) -> Any:
         timeout = timeout or (REST_TIMEOUT_BULKY if bulky else REST_TIMEOUT)
@@ -216,18 +257,39 @@ class RestClient:
             order.insert(0, self.current)
         last_err: Optional[Exception] = None
         for base in order:
-            url = base + "/api/v3" + path
-            try:
-                r = self.session.get(url, timeout=timeout)
-                if r.status_code != 200:
-                    last_err = RuntimeError(f"{base} HTTP {r.status_code}")
-                    log.debug("REST %s failed: %s", url, last_err)
+            url = base + REST_PREFIX + path
+            for attempt in range(REST_403_ATTEMPTS):
+                try:
+                    r = self.session.get(url, timeout=timeout, allow_redirects=False)
+                except Exception as e:
+                    last_err = e
+                    log.debug("REST %s error: %s", url, e)
+                    break
+                if r.status_code == 403 and attempt + 1 < REST_403_ATTEMPTS:
+                    delay = cloudfront_403_backoff(attempt)
+                    why = "CloudFront 403" if _is_cloudfront_403(r) else "HTTP 403"
+                    last_err = RuntimeError(f"{base} {why}")
+                    log.warning("REST %s %s; retrying in %.2fs (%s/%s)", url, why, delay, attempt + 1, REST_403_ATTEMPTS)
+                    self._sleep(delay)
                     continue
+                if r.status_code != 200:
+                    if _is_restricted(r):
+                        self.saw_restricted = True
+                    detail = _response_text(r).replace("\n", " ").strip()
+                    msg = f"{base} HTTP {r.status_code}"
+                    if detail:
+                        msg = f"{msg} {detail}"
+                    last_err = RuntimeError(msg)
+                    log.debug("REST %s failed: %s", url, last_err)
+                    break
+                try:
+                    payload = r.json()
+                except Exception as e:
+                    last_err = e
+                    log.debug("REST %s invalid JSON: %s", url, e)
+                    break
                 self.current = base
-                return r.json()
-            except Exception as e:
-                last_err = e
-                log.debug("REST %s error: %s", url, e)
+                return payload
         raise RuntimeError(f"All REST bases failed for {path}: {last_err}")
 
     def klines(self, symbol: str, tf: str, limit: int = 1000) -> list[dict]:
@@ -245,13 +307,14 @@ class RestClient:
         return out
 
     def top_usdt(self, n: int) -> list[str]:
-        info = self.get("/exchangeInfo?permissions=SPOT", bulky=True)
+        # Same universe as the chart coin list: TRADING USDT perpetuals.
+        info = self.get("/exchangeInfo", bulky=True)
         allowed = {
             s["symbol"]
             for s in (info.get("symbols") or [])
             if s.get("status") == "TRADING"
             and s.get("quoteAsset") == "USDT"
-            and s.get("isSpotTradingAllowed") is not False
+            and s.get("contractType") == "PERPETUAL"
         }
         ticks = self.get("/ticker/24hr", bulky=True)
         rows = []
@@ -367,7 +430,7 @@ class SignalBot:
                 for s in top:
                     if s not in symbols:
                         symbols.append(s)
-                log.info("Top %s by volume added; watching %s symbols", n, len(symbols))
+                log.info("Top %s USD-M perpetuals by volume added; watching %s symbols", n, len(symbols))
             except Exception as e:
                 log.error("top-N volume fetch failed: %s", e)
         for sym in symbols:
@@ -465,7 +528,7 @@ class SignalBot:
                 await asyncio.sleep(1)
                 continue
             host = WS_HOSTS[host_i % len(WS_HOSTS)]
-            url = host + "/stream?streams=" + "/".join(streams)
+            url = combined_stream_url(host, streams)
             log.info("WebSocket connecting %s (%s streams)", host, len(streams))
             try:
                 async with websockets.connect(
@@ -577,7 +640,9 @@ class SignalBot:
 
     async def run(self) -> None:
         log.info(
-            "coin-chart signal bot starting  symbols=%s  tfs=%s  sensitivity=%s  telegram=%s",
+            "coin-chart signal bot starting  market=USD-M  rest=%s  ws=%s  symbols=%s  tfs=%s  sensitivity=%s  telegram=%s",
+            REST_BASES[0] + REST_PREFIX,
+            WS_HOSTS[0],
             ",".join(self.cfg["symbols"]),
             ",".join(self.cfg["timeframes"]),
             self.cfg["sensitivity"],
@@ -609,7 +674,7 @@ def setup_logging() -> None:
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="coin-chart v7 ATR swing signal bot (alerts only)")
+    p = argparse.ArgumentParser(description="coin-chart v7 ATR swing signal bot for USD-M Futures (alerts only)")
     p.add_argument("--config", type=Path, default=None, help="YAML or JSON config (see config.example.yaml)")
     p.add_argument("--once", action="store_true", help="Seed history, print last signals, exit (no live stream)")
     p.add_argument("--no-telegram", action="store_true", help="Console alerts only")

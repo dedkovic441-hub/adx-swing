@@ -23,7 +23,8 @@ function detect(html, candles, tf, sens, nowMs) {
     var state = { tf: ${JSON.stringify(tf)}, candles: candles };
     var __NOW = ${nowMs == null ? "Date.now()" : String(nowMs)};
     var Date = { now: function(){ return __NOW; } };
-    ${between(html, "rsiVal", "wmaNum")}
+    // detectSwingSignals calls emaArr for the entry score.
+    ${between(html, "emaArr", "wmaNum")}
     ${between(html, "trueRangeArr", "computeSsl")}
     ${between(html, "volSmaPrev", "linePts")}
     ${between(html, "atrArr", "getActiveSignals")}

@@ -18,7 +18,7 @@ sensitivity: medium
 # Alert faded BUY?/SELL? developing pivots (off in the chart's "show forming" sense)
 provisional_alerts: false
 
-# 0 = only the symbols list. If > 0, also watch the top N Binance Spot USDT pairs by 24h quote volume.
+# 0 = only the symbols list. If > 0, also watch the top N USD-M perpetual USDT pairs by 24h quote volume.
 top_n_by_volume: 0
 
 state_file: state.json
