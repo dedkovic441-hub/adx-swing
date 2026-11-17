@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Virtual (paper) execution of ADX Swing BUY/SELL signals.
+"""Virtual (paper) execution of Zigzag Swing BUY/SELL signals.
 
 No Binance account, API keys, or real orders. Two isolated accounts:
 Confirmed fills at the confirmation-candle close; Unconfirmed fills at

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Auto-restart wrapper for the ADX Swing alert bot (signal_bot.py).
+# Auto-restart wrapper for the Zigzag Swing alert bot (signal_bot.py).
 # Does not start Telegram unless those env vars are already set; we pass --no-telegram.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

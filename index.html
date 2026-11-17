@@ -11,7 +11,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="description" id="page-description" content="Live Binance USD-M Futures chart with technical indicators, trading signals, and an adjustable 1–7 day backtest." />
-  <title>ADX Swing — Live Binance USD-M Futures Chart & Signals</title>
+  <title>Zigzag Swing — Live Binance USD-M Futures Chart & Signals</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230b0e11'/%3E%3Cpath d='M3 11 L7 6 L10 9 L13 4' stroke='%230ecb81' stroke-width='1.6' fill='none'/%3E%3C/svg%3E" />
   <script src="vendor/lightweight-charts.standalone.production.js?v=7.10"></script>
   <script>
@@ -1828,7 +1828,7 @@
       var chg = isFinite(t.changePct) ? t.changePct : NaN;
       document.getElementById("pair").textContent = pairLabel(state.symbol);
       var activePair = pairLabel(state.symbol);
-      document.title = activePair + " — ADX Swing";
+      document.title = activePair + " — Zigzag Swing";
       var pageDescription = document.getElementById("page-description");
       if (pageDescription) pageDescription.setAttribute("content", "Live " + activePair + " Binance USD-M Futures chart with real-time price, technical indicators, buy/sell signals, and an adjustable 1–7 day backtest.");
       document.getElementById("last").textContent = fmtPrice(last);

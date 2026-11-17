@@ -20,4 +20,4 @@ for P in $(pgrep -f "$ROOT/bot/signal_bot.py" || true); do
   kill -9 "$P" 2>/dev/null || true
   echo "killed leftover bot pid $P"
 done
-echo "ADX Swing bot stopped"
+echo "Zigzag Swing bot stopped"

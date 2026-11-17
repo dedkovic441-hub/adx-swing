@@ -28,7 +28,7 @@ from swing import INTERVAL_MS, detect_swing_signals  # noqa: E402
 import paper_engine  # noqa: E402
 
 JAKARTA = ZoneInfo("Asia/Jakarta")
-CHART_DEFAULT = "https://dedkovic441-hub.github.io/adx-swing/"
+CHART_DEFAULT = "https://dedkovic441-hub.github.io/zigzag-swing/"
 ALERTS_JSONL = Path("/workspace/adx-swing-bot/alerts.jsonl")
 ALERTS_UNCONFIRMED_JSONL = Path("/workspace/adx-swing-bot/alerts_unconfirmed.jsonl")
 

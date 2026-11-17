@@ -1,6 +1,6 @@
-# ADX Swing signal bot
+# Zigzag Swing signal bot
 
-Alert-only Python bot that ports the [ADX Swing](https://dedkovic441-hub.github.io/adx-swing/) v7 ATR-adaptive zigzag **exactly**. It marks confirmed swing bottoms as BUY and swing tops as SELL, then prints them to the console and optionally sends Telegram messages.
+Alert-only Python bot that ports the [Zigzag Swing](https://dedkovic441-hub.github.io/zigzag-swing/) v7 ATR-adaptive zigzag **exactly**. It marks confirmed swing bottoms as BUY and swing tops as SELL, then prints them to the console and optionally sends Telegram messages.
 
 It does **not** place, cancel, or manage trades.
 
@@ -73,7 +73,7 @@ A confirmed alert looks like:
 PUMPUSDT 5m BUY @ 0.00332 (bottom)
 pivot 2026-11-14 15:42:00 Asia/Jakarta
 confirmed 2026-11-14 15:47:00 Asia/Jakarta  lag 11 bars  ★★☆
-https://dedkovic441-hub.github.io/adx-swing/?symbol=PUMPUSDT&tf=5m
+https://dedkovic441-hub.github.io/zigzag-swing/?symbol=PUMPUSDT&tf=5m
 ```
 
 The chart link opens that symbol and timeframe on the live Pages app (v7.1+).

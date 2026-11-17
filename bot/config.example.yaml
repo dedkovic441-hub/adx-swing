@@ -42,7 +42,7 @@ provisional_alerts: false
 top_n_by_volume: 0
 
 state_file: state.json
-chart_url: https://dedkovic441-hub.github.io/adx-swing/
+chart_url: https://dedkovic441-hub.github.io/zigzag-swing/
 
 # REST polling interval (also used as a backup while the WebSocket is live)
 poll_interval_sec: 15
