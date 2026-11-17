@@ -7,10 +7,13 @@ the close of the candle when a BUY?/SELL? first appears.
 
 Unconfirmed scale-in: if that forming pivot disappears (fades/repaints),
 the open position is kept. A later same-direction unconfirmed signal on
-the same symbol+timeframe adds another leg sized to the first leg's
+the same symbol+timeframe can add another leg sized to the first leg's
 notional (not a fixed account default), up to max_add_positions extra
-legs (default 4, so 5 legs total). Opposite unconfirmed signals still
-close the whole stacked position and flip.
+legs (default 4, so 5 legs total). On timeframes in
+dca_every_signal_timeframes (default 15m), every new same-direction
+unconfirmed signal adds a leg with no fade required. Other timeframes
+(default 5m) still need a fade before a same-direction add. Opposite
+unconfirmed signals still close the whole stacked position and flip.
 
 One position per symbol+timeframe: BUY opens long, SELL opens short.
 
@@ -39,6 +42,7 @@ NOTIONAL = 50.0
 LEVERAGE = 1.0
 TAKER_FEE = 0.0005  # 0.05% per side
 DEFAULT_MAX_ADD_POSITIONS = 4
+DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES = ("15m",)
 WIB = timezone(timedelta(hours=7))
 
 
@@ -58,26 +62,45 @@ def _pos_key(symbol: str, tf: str) -> str:
     return f"{symbol}:{tf}"
 
 
+def is_new_unconfirmed_pivot(prev: dict | None, curr: dict | None) -> bool:
+    """True when curr is a different forming pivot than prev (a pivot walk)."""
+    if not prev or not curr:
+        return False
+    if prev.get("time") != curr.get("time"):
+        return True
+    if prev.get("id") != curr.get("id"):
+        return True
+    return False
+
+
+def _load_unconfirmed_yaml(config_path: Optional[Path] = None) -> tuple[Optional[dict], str, Path]:
+    path = config_path or (ROOT / "bot" / "config.yaml")
+    if not path.exists():
+        return None, "", path
+    text = path.read_text(encoding="utf-8")
+    data = None
+    try:
+        import yaml
+        loaded = yaml.safe_load(text) or {}
+        if isinstance(loaded, dict):
+            data = loaded
+    except Exception:
+        data = None
+    return data, text, path
+
+
 def load_unconfirmed_max_add(config_path: Optional[Path] = None) -> int:
     """Read unconfirmed.max_add_positions from config.yaml; default 4."""
-    path = config_path or (ROOT / "bot" / "config.yaml")
     try:
+        data, text, path = _load_unconfirmed_yaml(config_path)
         if not path.exists():
             return DEFAULT_MAX_ADD_POSITIONS
-        text = path.read_text(encoding="utf-8")
-        data = None
-        try:
-            import yaml
-            data = yaml.safe_load(text) or {}
-        except Exception:
-            data = None
         if isinstance(data, dict):
             raw = data.get("unconfirmed")
             if isinstance(raw, dict) and raw.get("max_add_positions") is not None:
                 return max(0, int(raw["max_add_positions"]))
             if data.get("unconfirmed_max_add_positions") is not None:
                 return max(0, int(data["unconfirmed_max_add_positions"]))
-        # Fallback if PyYAML is not on this interpreter
         for line in text.splitlines():
             s = line.split("#", 1)[0].strip()
             if s.startswith("max_add_positions:") or s.startswith("unconfirmed_max_add_positions:"):
@@ -85,6 +108,58 @@ def load_unconfirmed_max_add(config_path: Optional[Path] = None) -> int:
     except Exception:
         pass
     return DEFAULT_MAX_ADD_POSITIONS
+
+
+def load_unconfirmed_dca_timeframes(config_path: Optional[Path] = None) -> list[str]:
+    """Read unconfirmed.dca_every_signal_timeframes; default ['15m'].
+
+    An explicit empty list means no timeframe uses fade-free DCA adds.
+    """
+    q = "'\""
+    try:
+        data, text, path = _load_unconfirmed_yaml(config_path)
+        if not path.exists():
+            return list(DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES)
+        raw_list = None
+        if isinstance(data, dict):
+            raw = data.get("unconfirmed")
+            if isinstance(raw, dict) and "dca_every_signal_timeframes" in raw:
+                raw_list = raw.get("dca_every_signal_timeframes")
+            elif "unconfirmed_dca_every_signal_timeframes" in data:
+                raw_list = data.get("unconfirmed_dca_every_signal_timeframes")
+        if raw_list is not None:
+            return [str(t).lower() for t in (raw_list or [])]
+        # Fallback if PyYAML is not on this interpreter
+        collecting = False
+        found = False
+        acc: list[str] = []
+        for line in text.splitlines():
+            s = line.split("#", 1)[0].rstrip()
+            stripped = s.strip()
+            if stripped.startswith("dca_every_signal_timeframes:"):
+                found = True
+                rest = stripped.split(":", 1)[1].strip()
+                if rest.startswith("[") and rest.endswith("]"):
+                    inner = rest[1:-1].strip()
+                    return [p.strip().strip(q).lower() for p in inner.split(",") if p.strip()]
+                if rest:
+                    acc.append(rest.strip("- ").strip(q).lower())
+                    collecting = False
+                else:
+                    collecting = True
+                continue
+            if collecting:
+                if stripped.startswith("-"):
+                    token = stripped[1:].strip().strip(q).lower()
+                    if token:
+                        acc.append(token)
+                elif stripped:
+                    break
+        if found:
+            return acc
+    except Exception:
+        pass
+    return list(DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES)
 
 
 def default_state() -> dict:
@@ -112,6 +187,7 @@ class PaperEngine:
         lock_path: Optional[Path] = None,
         scale_in: bool = False,
         max_add_positions: int = DEFAULT_MAX_ADD_POSITIONS,
+        dca_every_signal_timeframes: Optional[list[str]] = None,
     ):
         self.state_path = state_path
         self.trades_path = trades_path
@@ -119,6 +195,8 @@ class PaperEngine:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self.scale_in = bool(scale_in)
         self.max_add_positions = max(0, int(max_add_positions))
+        tfs = DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES if dca_every_signal_timeframes is None else dca_every_signal_timeframes
+        self.dca_every_signal_timeframes = {str(t).lower() for t in tfs}
 
     def _lock_file(self):
         fh = open(self.lock_path, "a+")
@@ -244,11 +322,23 @@ class PaperEngine:
         log.info("paper OPEN %s %s %s @ %s qty=%s fee=%.5f", symbol, tf, side, price, qty, fee)
         return pos
 
-    def _try_add_leg(self, st: dict, pos: dict, price: float, now: datetime) -> Optional[dict]:
-        """Add one same-direction leg after a fade, sized to the first leg's notional."""
+    def _requires_fade_to_add(self, tf: str) -> bool:
+        return str(tf or "").lower() not in self.dca_every_signal_timeframes
+
+    def _try_add_leg(
+        self,
+        st: dict,
+        pos: dict,
+        price: float,
+        now: datetime,
+        require_fade: Optional[bool] = None,
+    ) -> Optional[dict]:
+        """Add one same-direction leg sized to the first leg's notional."""
         self._normalize_position(pos)
         symbol, tf, side = pos["symbol"], pos["timeframe"], pos["side"]
-        if not pos.get("faded"):
+        if require_fade is None:
+            require_fade = self._requires_fade_to_add(tf)
+        if require_fade and not pos.get("faded"):
             log.info(
                 "paper already %s %s %s — ignoring same-side signal (no fade since last entry)",
                 symbol, tf, side,
@@ -313,7 +403,7 @@ class PaperEngine:
             "total_qty": pos["qty"],
             "total_notional": pos["notional"],
             "leg_count": pos["leg_count"],
-            "reason": "scale_in",
+            "reason": "dca" if not require_fade else "scale_in",
             "at_utc": leg["opened_at_utc"],
             "at_wib": leg["opened_at_wib"],
             "balance": st["balance"],
@@ -497,6 +587,7 @@ def get_unconfirmed_engine() -> PaperEngine:
             lock_path=UNCONF_LOCK_PATH,
             scale_in=True,
             max_add_positions=load_unconfirmed_max_add(),
+            dca_every_signal_timeframes=load_unconfirmed_dca_timeframes(),
         )
     return _UNCONF_ENGINE
 

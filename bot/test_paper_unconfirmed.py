@@ -21,6 +21,7 @@ def _engine(tmp: Path, **kwargs) -> pe.PaperEngine:
         lock_path=tmp / "paper_unconfirmed.lock",
         scale_in=True,
         max_add_positions=kwargs.get("max_add_positions", 4),
+        dca_every_signal_timeframes=kwargs.get("dca_every_signal_timeframes", ["15m"]),
     )
 
 
@@ -209,6 +210,61 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         self.assertEqual(_trades(conf)[-1]["action"], "CLOSE")
         self.assertEqual(_trades(conf)[-1]["reason"], "repainted")
 
+    def test_15m_dca_adds_without_fade(self):
+        self.eng.on_signal("DCAUSDT", "15m", "SELL?", 10.0)
+        self.eng.on_signal("DCAUSDT", "15m", "SELL?", 9.0)
+        st = self.eng.load()
+        pos = st["positions"]["DCAUSDT:15m"]
+        self.assertEqual(pos["leg_count"], 2)
+        self.assertEqual(pos["notional"], 100.0)
+        self.assertEqual(pos["first_notional"], 50.0)
+        self.assertFalse(pos["faded"])
+        self.assertAlmostEqual(pos["qty"], 50.0 / 10.0 + 50.0 / 9.0)
+        add = [t for t in _trades(self.eng) if t["action"] == "ADD"][0]
+        self.assertEqual(add["reason"], "dca")
+        self.assertEqual(add["notional"], 50.0)
+
+    def test_15m_dca_uses_first_leg_notional(self):
+        st = self.eng.load()
+        st["notional"] = 30.0
+        self.eng.save(st)
+        self.eng.on_signal("DCA30USDT", "15m", "BUY?", 3.0)
+        self.eng.on_signal("DCA30USDT", "15m", "BUY?", 4.0)
+        pos = self.eng.load()["positions"]["DCA30USDT:15m"]
+        self.assertEqual(pos["first_notional"], 30.0)
+        self.assertEqual(pos["notional"], 60.0)
+        self.assertEqual(pos["leg_count"], 2)
+
+    def test_15m_dca_respects_add_cap(self):
+        self.eng.on_signal("CAP15USDT", "15m", "SELL?", 20.0)
+        for px in (19.0, 18.0, 17.0, 16.0, 15.0):
+            self.eng.on_signal("CAP15USDT", "15m", "SELL?", px)
+        pos = self.eng.load()["positions"]["CAP15USDT:15m"]
+        self.assertEqual(pos["leg_count"], 5)
+        self.assertEqual(pos["notional"], 250.0)
+        self.eng.on_signal("CAP15USDT", "15m", "SELL?", 14.0)
+        pos = self.eng.load()["positions"]["CAP15USDT:15m"]
+        self.assertEqual(pos["leg_count"], 5)
+        adds = [t for t in _trades(self.eng) if t["action"] == "ADD"]
+        self.assertEqual(len(adds), 4)
+
+    def test_5m_still_requires_fade_even_when_15m_dca_enabled(self):
+        self.eng.on_signal("FIVEUSDT", "5m", "BUY?", 10.0)
+        self.eng.on_signal("FIVEUSDT", "5m", "BUY?", 11.0)
+        pos = self.eng.load()["positions"]["FIVEUSDT:5m"]
+        self.assertEqual(pos["leg_count"], 1)
+        self.assertEqual([t["action"] for t in _trades(self.eng)], ["OPEN"])
+
+    def test_is_new_unconfirmed_pivot(self):
+        a = {"side": "SELL", "time": 100, "id": "top"}
+        b = {"side": "SELL", "time": 200, "id": "top"}
+        c = {"side": "SELL", "time": 100, "id": "top"}
+        d = {"side": "SELL", "time": 100, "id": "top2"}
+        self.assertTrue(pe.is_new_unconfirmed_pivot(a, b))
+        self.assertFalse(pe.is_new_unconfirmed_pivot(a, c))
+        self.assertTrue(pe.is_new_unconfirmed_pivot(a, d))
+        self.assertFalse(pe.is_new_unconfirmed_pivot(a, None))
+
     def test_load_unconfirmed_max_add_from_yaml(self):
         cfg = self.tmp / "config.yaml"
         cfg.write_text("unconfirmed:\n  max_add_positions: 2\n", encoding="utf-8")
@@ -216,6 +272,18 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         cfg.write_text("symbols: [AKEUSDT]\n", encoding="utf-8")
         self.assertEqual(pe.load_unconfirmed_max_add(cfg), 4)
         self.assertEqual(pe.load_unconfirmed_max_add(self.tmp / "missing.yaml"), 4)
+
+    def test_load_unconfirmed_dca_timeframes_from_yaml(self):
+        cfg = self.tmp / "config.yaml"
+        cfg.write_text("unconfirmed:\n  dca_every_signal_timeframes: [15m]\n", encoding="utf-8")
+        self.assertEqual(pe.load_unconfirmed_dca_timeframes(cfg), ["15m"])
+        cfg.write_text("unconfirmed:\n  dca_every_signal_timeframes:\n    - 15m\n    - 1h\n", encoding="utf-8")
+        self.assertEqual(pe.load_unconfirmed_dca_timeframes(cfg), ["15m", "1h"])
+        cfg.write_text("unconfirmed:\n  dca_every_signal_timeframes: []\n", encoding="utf-8")
+        self.assertEqual(pe.load_unconfirmed_dca_timeframes(cfg), [])
+        cfg.write_text("symbols: [AKEUSDT]\n", encoding="utf-8")
+        self.assertEqual(pe.load_unconfirmed_dca_timeframes(cfg), ["15m"])
+        self.assertEqual(pe.load_unconfirmed_dca_timeframes(self.tmp / "missing.yaml"), ["15m"])
 
 
 if __name__ == "__main__":

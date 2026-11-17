@@ -50,5 +50,10 @@ poll_interval_sec: 15
 # Unconfirmed paper account: a faded BUY?/SELL? keeps the position open.
 # A later same-direction unconfirmed signal adds another leg sized to the
 # first leg's notional. max_add_positions is additional legs (4 → 5 total).
+# Timeframes in dca_every_signal_timeframes add a leg on every new
+# same-direction unconfirmed signal (including a pivot walk), with no fade
+# required. Other timeframes still need a fade first.
 unconfirmed:
   max_add_positions: 4
+  dca_every_signal_timeframes:
+    - 15m

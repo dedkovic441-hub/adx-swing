@@ -200,6 +200,8 @@ def load_config(path: Optional[Path]) -> dict:
         "poll_interval_sec": float(cfg.get("poll_interval_sec") or 1),
         "telegram_token": os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN") or "",
         "telegram_chat": os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT") or "",
+        "unconfirmed_dca_every_signal_timeframes": paper_engine.load_unconfirmed_dca_timeframes(path),
+        "unconfirmed_max_add_positions": paper_engine.load_unconfirmed_max_add(path),
     })
     return cfg
 
@@ -456,6 +458,10 @@ def _prov_snapshot(sig: dict | None) -> dict | None:
         "id": sig.get("id"),
         "swingKind": sig.get("swingKind"),
     }
+
+
+def _is_new_unconfirmed_pivot(prev: dict | None, curr: dict | None) -> bool:
+    return paper_engine.is_new_unconfirmed_pivot(prev, curr)
 
 
 def _confirmed_same_pivot(pack: dict, prev: dict | None) -> bool:
@@ -744,8 +750,11 @@ class SignalBot:
 
         Historic provisionals are recorded at seed and not traded. A later
         confirmation of the same pivot is not treated as a repaint. A fade
-        (forming pivot disappears) keeps the unconfirmed paper position open;
-        a later new same-direction unconfirmed signal may add a leg.
+        (forming pivot disappears) keeps the unconfirmed paper position open.
+        On timeframes in unconfirmed.dca_every_signal_timeframes (default 15m),
+        every new same-direction unconfirmed pivot — including a pivot walk —
+        writes a new alert and may add a leg with no fade required. Other
+        timeframes still need a fade before a same-direction add.
         """
         key = (mkt.symbol, mkt.tf)
         prev = self._last_prov.get(key)
@@ -767,7 +776,20 @@ class SignalBot:
                     )
                 elif fill is not None:
                     paper_engine.close_unconfirmed_repainted(mkt.symbol, mkt.tf, fill)
-            # same-side pivot walk (no intervening fade): keep the open position, do not re-alert
+            elif curr and prev and prev_side == curr_side and _is_new_unconfirmed_pivot(prev, curr):
+                dca_tfs = {
+                    str(t).lower()
+                    for t in (self.cfg.get("unconfirmed_dca_every_signal_timeframes") or [])
+                }
+                if "unconfirmed_dca_every_signal_timeframes" not in self.cfg:
+                    dca_tfs = {"15m"}
+                if mkt.tf in dca_tfs:
+                    # 15m (or configured) DCA: new same-direction pivot writes a
+                    # new alert and can add a leg without a fade.
+                    if fill is not None:
+                        paper_engine.on_unconfirmed_signal(mkt.symbol, mkt.tf, curr["name"], fill)
+                    append_unconfirmed_alert_jsonl(mkt.symbol, mkt.tf, pack.get("provisional") or curr, bar)
+            # 5m / non-DCA same-side walk with no fade: keep the open position, do not re-alert
         except Exception as e:
             log.error("unconfirmed paper/alert failed %s %s: %s", mkt.symbol, mkt.tf, e)
         self._last_prov[key] = curr
