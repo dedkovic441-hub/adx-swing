@@ -8,9 +8,9 @@ The bot must run on a machine that stays online. A laptop that sleeps will miss 
 
 ## What it does
 
-- Watches Binance Spot symbols and timeframes you configure
-- Seeds the last 1,000 candles over REST (same endpoint failover as the chart)
-- Streams combined kline WebSockets, with auto-reconnect and REST polling fallback
+- Watches Binance USD-M Futures symbols and timeframes you configure (the same market as the live chart)
+- Seeds the last 1,000 candles from `https://fapi.binance.com/fapi/v1/klines`, with the chart's `fapi1`–`fapi4` failover. An intermittent CloudFront HTTP 403 is retried on that host with a short backoff before the next host is tried
+- Streams combined kline WebSockets from `wss://fstream.binance.com`, with auto-reconnect and REST polling fallback
 - On each **closed** candle, recomputes the v7 zigzag (ATR 14, Sensitivity Low/Med/High, percent floor, 3×ATR shock-wick clip, alternation, quality stars)
 - Alerts only **new** confirmed signals after startup. Historic signals are logged, never re-alerted. A small `state.json` file remembers what was already sent across restarts
 
@@ -19,7 +19,7 @@ Default watch list: `PUMPUSDT`, `BTCUSDT`, `ETHUSDT` on `5m` and `15m`, sensitiv
 ## Requirements
 
 - Python 3.10 or newer
-- Outbound HTTPS and WebSocket access to Binance (`data-api.binance.vision`, `api.binance.com`, `data-stream.binance.vision`, …)
+- Outbound HTTPS to Binance USD-M Futures REST (`https://fapi.binance.com/fapi/v1`, plus `fapi1`–`fapi4`) and WebSocket (`wss://fstream.binance.com`)
 
 ## Install
 
@@ -33,7 +33,7 @@ pip install -r requirements.txt
 cp config.example.yaml config.yaml
 ```
 
-`config.yaml` is gitignored. Edit symbols, timeframes, and sensitivity there. Set `top_n_by_volume: 20` (for example) to also watch the top 20 USDT pairs by 24h quote volume, in addition to the explicit symbol list.
+`config.yaml` is gitignored. Edit symbols, timeframes, and sensitivity there. Set `top_n_by_volume: 20` (for example) to also watch the top 20 USD-M perpetual USDT pairs by 24h quote volume, in addition to the explicit symbol list.
 
 ## Configure Telegram (optional)
 
@@ -122,7 +122,7 @@ Free-tier always-on hosts (a small VPS, Oracle Cloud free tier, a home Raspberry
 
 ## Parity test
 
-The Python engine is checked against the JavaScript in `index.html` on the same 1,000-bar kline windows (PUMPUSDT 5m, ANKRUSDT 1D, BTCUSDT 1h). Pivot time, side, and price must match.
+The Python engine is checked against the JavaScript in `index.html` on the same 1,000-bar USD-M Futures kline windows (PUMPUSDT 5m, ANKRUSDT 1D, BTCUSDT 1h). Pivot time, side, and price must match. Candles come from `https://fapi.binance.com/fapi/v1/klines`. From a region where that host returns HTTP 451, the check uses the public USD-M kline archive on data.binance.vision, which is the published copy of those candles.
 
 ```bash
 # needs node + Python 3.10+ (network used to fetch klines)

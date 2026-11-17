@@ -1,5 +1,6 @@
 [Unit]
-Description=coin-chart ATR swing signal bot (alert only)
+Description=coin-chart USD-M Futures ATR swing signal bot (alert only)
+# Outbound: HTTPS https://fapi.binance.com/fapi/v1 and WSS wss://fstream.binance.com
 After=network-online.target
 Wants=network-online.target
 

@@ -14,6 +14,6 @@ Smartphone-first live chart for Binance USD-M Futures USDT pairs. BUY marks a co
 - Times in UTC+7 (Asia/Jakarta)
 - Adjustable 1–7 day backtest on the current symbol and timeframe: enter at the confirmation close (no lookahead), flip long/short (or long-only), configurable long/short take-profit and stop-loss, 0.1% fee per side. Shows trades, win rate, total return, average trade, max drawdown, and buy-and-hold. A pivot-price result is labeled hindsight-only
 - Deep links: `?symbol=BTCUSDT&tf=15m`
-- Optional alert-only Python bot (same swing logic): see [`bot/README.md`](bot/README.md)
+- Optional alert-only Python bot on the same USD-M Futures feed (same swing logic): see [`bot/README.md`](bot/README.md)
 
 The Tokocrypto version has been removed. `binance.html` redirects here.

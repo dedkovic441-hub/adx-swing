@@ -1,3 +1,6 @@
+# USD-M Futures alert bot.
+# Needs outbound HTTPS to https://fapi.binance.com/fapi/v1 (fapi1–fapi4 failover)
+# and WebSocket to wss://fstream.binance.com.
 FROM python:3.12-slim
 
 WORKDIR /app
