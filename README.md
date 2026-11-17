@@ -1,8 +1,8 @@
-# Coin Chart — Binance USD-M Futures
+# ADX Swing — Binance USD-M Futures
 
 Smartphone-first live chart for Binance USD-M Futures USDT pairs. BUY marks a confirmed swing bottom and SELL marks a confirmed swing top, using an ATR-adaptive zigzag.
 
-**Live:** https://dedkovic441-hub.github.io/coin-chart/
+**Live:** https://dedkovic441-hub.github.io/adx-swing/
 
 - Default symbol: PUMP/USDT (last choice is remembered)
 - Coin list from USD-M Futures `exchangeInfo` (TRADING USDT), with live futures prices

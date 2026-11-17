@@ -24,7 +24,7 @@ if str(BOT_DIR) not in sys.path:
 from swing import INTERVAL_MS, detect_swing_signals  # noqa: E402
 
 JAKARTA = ZoneInfo("Asia/Jakarta")
-CHART_DEFAULT = "https://dedkovic441-hub.github.io/coin-chart/"
+CHART_DEFAULT = "https://dedkovic441-hub.github.io/adx-swing/"
 
 # Same USD-M Futures hosts as index.html. Public market data only.
 REST_BASES = [
