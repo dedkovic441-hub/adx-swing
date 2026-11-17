@@ -182,8 +182,8 @@ def check_rest_client() -> None:
     assert client.get("/klines?symbol=BTCUSDT&interval=1h&limit=1") == [["ok"]]
     assert calls[0] == "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=1"
     assert len(calls) == REST_403_ATTEMPTS
-    assert sleeps == [cloudfront_403_backoff(i) for i in range(REST_403_ATTEMPTS - 1)]
-    assert all(delay <= 1.0 for delay in sleeps)
+    # Backoff is zero: a 403 retries immediately on a fresh connection.
+    assert sleeps == []
     assert all("/api/v3" not in url and urlparse(url).hostname == "fapi.binance.com" for url in calls)
 
     calls.clear()
@@ -204,7 +204,7 @@ def check_rest_client() -> None:
     assert failover.get("/ping") == {"ok": True}
     assert sum(urlparse(url).hostname == "fapi.binance.com" for url in calls) == REST_403_ATTEMPTS
     assert urlparse(calls[-1]).hostname == "fapi1.binance.com"
-    assert sleeps == [cloudfront_403_backoff(i) for i in range(REST_403_ATTEMPTS - 1)]
+    assert sleeps == []
 
     calls.clear()
     sleeps.clear()

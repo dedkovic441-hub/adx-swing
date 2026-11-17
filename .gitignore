@@ -10,6 +10,7 @@ alerts_unconfirmed.jsonl
 paper_trades.jsonl
 paper_trades_unconfirmed.jsonl
 forwarded.json
+forwarded*.json
 *.log
 .venv/
 bot/.venv/

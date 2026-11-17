@@ -10,6 +10,8 @@ import os
 import signal
 import sys
 import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 from datetime import datetime, timezone, timedelta
@@ -41,14 +43,25 @@ REST_BASES = [
 REST_PREFIX = "/fapi/v1"
 REST_TIMEOUT = 4
 REST_TIMEOUT_BULKY = 8
-# fapi.binance.com sits behind CloudFront and sometimes answers HTTP 403
-# for a moment, then accepts the same request. Retry that host before failover.
-REST_403_ATTEMPTS = 5
-REST_403_BACKOFF_SEC = 0.2
+# fapi.binance.com sits behind CloudFront and sometimes answers HTTP 403.
+# A reused keep-alive session can stay stuck on 403; retry quickly with a
+# fresh connection, then fail over. Do not serial-sleep 5 times per symbol.
+REST_403_ATTEMPTS = 2
+REST_403_BACKOFF_SEC = 0.0
 WS_HOSTS = [
     "wss://fstream.binance.com",
 ]
 WS_CONNECT_TIMEOUT = 5
+# Client pings through this box's egress proxy often time out and drop an
+# otherwise connected socket. Rely on Binance's server pings (every ~20s,
+# 60s dead-timeout) and an application-level kline watchdog instead.
+WS_PING_INTERVAL = None
+WS_PING_TIMEOUT = None
+WS_RECV_WATCHDOG_SEC = 45
+WS_STALE_RECONNECT_SEC = 45
+CATCHUP_WORKERS = 8
+CATCHUP_TRIES = 4
+CATCHUP_AFTER_CLOSE_SEC = 0.8
 
 log = logging.getLogger("signal_bot")
 
@@ -257,6 +270,18 @@ class RestClient:
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "coin-chart-signal-bot/7.1"
         self.session.headers["Accept"] = "application/json"
+        # CloudFront 403s on this box often stick to a reused keep-alive socket.
+        self.session.headers["Connection"] = "close"
+
+    def _drop_connections(self) -> None:
+        """Close pooled sockets without replacing self.session (tests patch session.get)."""
+        try:
+            for adapter in list(getattr(self.session, "adapters", {}).values()):
+                closer = getattr(adapter, "close", None)
+                if closer:
+                    closer()
+        except Exception:
+            pass
 
     def _urllib_get(self, url: str, timeout: float):
         import urllib.request
@@ -296,8 +321,10 @@ class RestClient:
                     delay = cloudfront_403_backoff(attempt)
                     why = "CloudFront 403" if _is_cloudfront_403(r) else "HTTP 403"
                     last_err = RuntimeError(f"{base} {why}")
-                    log.warning("REST %s %s; retrying in %.2fs (%s/%s)", url, why, delay, attempt + 1, REST_403_ATTEMPTS)
-                    self._sleep(delay)
+                    log.warning("REST %s %s; retrying%s (%s/%s)", url, why, f" in {delay:.2f}s" if delay else " with a new connection", attempt + 1, REST_403_ATTEMPTS)
+                    self._drop_connections()
+                    if delay:
+                        self._sleep(delay)
                     continue
                 if r.status_code != 200:
                     if _is_restricted(r):
@@ -326,17 +353,7 @@ class RestClient:
 
     def klines(self, symbol: str, tf: str, limit: int = 1000) -> list[dict]:
         raw = self.get(f"/klines?symbol={symbol}&interval={tf}&limit={limit}", bulky=True)
-        out = []
-        for k in raw:
-            out.append({
-                "time": int(k[0]) // 1000,
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-            })
-        return out
+        return _parse_kline_rows(raw)
 
     def top_usdt(self, n: int) -> list[str]:
         # Same universe as the chart coin list: TRADING USDT perpetuals.
@@ -362,6 +379,71 @@ class RestClient:
         rows.sort(reverse=True)
         return [sym for _, sym in rows[:n]]
 
+
+def _parse_kline_rows(raw) -> list[dict]:
+    out = []
+    for k in raw or []:
+        out.append({
+            "time": int(k[0]) // 1000,
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5]),
+        })
+    return out
+
+
+def last_closed_open_time(tf: str, now: Optional[float] = None) -> int:
+    """Unix seconds open time of the most recently closed bar for `tf`."""
+    interval = INTERVAL_MS.get(tf, 60_000) / 1000.0
+    now = time.time() if now is None else now
+    current_open = int(now // interval) * int(interval)
+    return current_open - int(interval)
+
+
+def bar_close_lag_sec(open_s: int, tf: str, now: Optional[float] = None) -> float:
+    interval = INTERVAL_MS.get(tf, 60_000) / 1000.0
+    now = time.time() if now is None else now
+    return now - (int(open_s) + interval)
+
+
+def urllib_klines(symbol: str, tf: str, limit: int = 3, tries: int = CATCHUP_TRIES) -> list[dict]:
+    """Thread-safe kline fetch that does not share the bot's requests.Session.
+
+    Uses Connection: close and immediate retries so an intermittent CloudFront
+    403 does not stall other markets. www.binance.com is a last-resort host
+    and is not in REST_BASES (those stay official fapi* URLs).
+    """
+    path = f"/klines?symbol={symbol}&interval={tf}&limit={limit}"
+    bases = list(REST_BASES[:1]) + ["https://www.binance.com"]
+    last_err: Optional[Exception] = None
+    for attempt in range(max(1, int(tries))):
+        for base in bases:
+            url = base + REST_PREFIX + path
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "coin-chart-signal-bot/7.1",
+                    "Accept": "application/json",
+                    "Connection": "close",
+                },
+            )
+            try:
+                timeout = REST_TIMEOUT_BULKY if limit > 10 else REST_TIMEOUT
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    raw = json.loads(r.read().decode())
+                return _parse_kline_rows(raw)
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if "403" in msg or "Forbidden" in msg:
+                    log.warning("REST %s HTTP 403; retrying with a new connection (%s/%s)", url, attempt + 1, tries)
+                    continue
+                if any(code in msg for code in ("202", "302", "301")):
+                    break
+        # Immediate retry — do not sleep a backlog into other symbols.
+    raise RuntimeError(f"urllib klines failed for {symbol} {tf}: {last_err}")
 
 
 def _jsonl_key(rec: dict) -> str:
@@ -589,10 +671,22 @@ class Market:
         self.swing_early = swing_early
         self.candles: list[dict] = []
         self.pack: dict = {"signals": [], "provisional": None}
+        self._last_closed_key: Optional[tuple] = None
 
     def seed(self, candles: list[dict]) -> dict:
         self.candles = candles
         self.pack = detect_swing_signals(self.candles, self.tf, self.sensitivity, self.swing_early)
+        interval_ms = INTERVAL_MS.get(self.tf, 60_000)
+        now_ms = time.time() * 1000
+        last_closed = None
+        for c in reversed(self.candles):
+            if int(c["time"]) * 1000 + interval_ms <= now_ms + 500:
+                last_closed = c
+                break
+        if last_closed:
+            self._last_closed_key = (int(last_closed["time"]), float(last_closed["close"]))
+        else:
+            self._last_closed_key = None
         return self.pack
 
     def upsert(self, bar: dict, closed: bool) -> Optional[dict]:
@@ -607,6 +701,10 @@ class Market:
             del rows[: len(rows) - 1200]
         if not closed:
             return None
+        key = (int(bar["time"]), float(bar["close"]))
+        if key == self._last_closed_key:
+            return None
+        self._last_closed_key = key
         self.pack = detect_swing_signals(self.candles, self.tf, self.sensitivity, self.swing_early)
         return self.pack
 
@@ -641,6 +739,10 @@ class SignalBot:
         self._started = time.time()
         self._streams: list[str] = []
         self._last_prov: dict[tuple[str, str], dict | None] = {}
+        self._ws_kline_at = 0.0
+        self._ws_msgs = 0
+        self._ws_disconnects = 0
+        self._catchup_pool = ThreadPoolExecutor(max_workers=CATCHUP_WORKERS, thread_name_prefix="adx-rest")
 
     def watch_pairs(self) -> list[tuple[str, str]]:
         return sorted(self.markets.keys())
@@ -670,20 +772,32 @@ class SignalBot:
         self.state.save()
 
     def seed_all(self) -> None:
-        for (sym, tf), mkt in list(self.markets.items()):
+        items = list(self.markets.items())
+
+        def fetch_one(sym_tf):
+            (sym, tf), _mkt = sym_tf
+            last_err = None
+            for attempt in range(4):
+                try:
+                    return sym, tf, urllib_klines(sym, tf, 1000, tries=4), None
+                except Exception as e:
+                    last_err = e
+                    log.warning("seed retry %s %s (%s/4): %s", sym, tf, attempt + 1, e)
+            return sym, tf, None, last_err
+
+        fetched: dict[tuple[str, str], list] = {}
+        with ThreadPoolExecutor(max_workers=CATCHUP_WORKERS, thread_name_prefix="adx-seed") as pool:
+            for sym, tf, candles, err in pool.map(fetch_one, items):
+                if err is not None or candles is None:
+                    log.error("seed failed %s %s: %s", sym, tf, err)
+                    continue
+                fetched[(sym, tf)] = candles
+
+        for (sym, tf), mkt in items:
+            if (sym, tf) not in fetched:
+                continue
             try:
-                candles = None
-                last_err = None
-                for attempt in range(6):
-                    try:
-                        candles = self.rest.klines(sym, tf, 1000)
-                        break
-                    except Exception as e:
-                        last_err = e
-                        log.warning("seed retry %s %s (%s/6): %s", sym, tf, attempt + 1, e)
-                        time.sleep(2.0 * (attempt + 1))
-                if candles is None:
-                    raise last_err
+                candles = fetched[(sym, tf)]
                 pack = mkt.seed(candles)
                 sigs = pack["signals"]
                 last = sigs[-1] if sigs else None
@@ -808,112 +922,184 @@ class SignalBot:
         }
         closed = bool(k.get("x"))
         if closed:
-            log.info("closed candle %s %s %s close=%s", symbol, tf, fmt_jakarta(bar["time"]), fmt_price(bar["close"]))
+            lag = bar_close_lag_sec(bar["time"], tf)
+            log.info(
+                "closed candle %s %s %s close=%s lag=%.1fs source=ws",
+                symbol, tf, fmt_jakarta(bar["time"]), fmt_price(bar["close"]), lag,
+            )
         pack = mkt.upsert(bar, closed)
         if pack:
             self.on_pack(mkt, pack, True)
 
+    def _apply_closed_bars(self, mkt: Market, candles: list[dict], source: str) -> None:
+        """Apply REST catch-up bars in order, filling any gap since the last seed."""
+        if not candles:
+            return
+        interval_ms = INTERVAL_MS.get(mkt.tf, 60_000)
+        now_ms = time.time() * 1000
+        have = int(mkt._last_closed_key[0]) if mkt._last_closed_key else 0
+        for bar in candles:
+            if bar["time"] < have:
+                continue
+            closed = bar["time"] * 1000 + interval_ms <= now_ms + 500
+            is_new_closed = closed and bar["time"] > have
+            if is_new_closed:
+                lag = bar_close_lag_sec(bar["time"], mkt.tf)
+                log.info(
+                    "closed candle %s %s %s close=%s lag=%.1fs source=%s",
+                    mkt.symbol, mkt.tf, fmt_jakarta(bar["time"]), fmt_price(bar["close"]), lag, source,
+                )
+            pack = mkt.upsert(bar, closed)
+            if pack:
+                self.on_pack(mkt, pack, True)
+
     async def connect_ws_loop(self) -> None:
-        import websockets
-        host_i = 0
+        # Wait until markets exist, then run one self-healing socket per
+        # timeframe so a stall on 5m does not drop 15m (and vice versa).
+        while not self.stop.is_set() and not self.watch_pairs():
+            await asyncio.sleep(1)
+        if self.stop.is_set():
+            return
+        host = WS_HOSTS[0]
+        by_tf: dict[str, list[str]] = {}
+        for (sym, tf) in self.watch_pairs():
+            by_tf.setdefault(tf, []).append(f"{sym.lower()}@kline_{tf}")
+        groups = [g for g in by_tf.values() if g] or [
+            [f"{sym.lower()}@kline_{tf}" for (sym, tf) in self.watch_pairs()]
+        ]
+        log.info("WebSocket connecting %s (%s streams in %s sockets)", host, sum(len(g) for g in groups), len(groups))
+        tasks = [asyncio.create_task(self._ws_group_loop(host, group, gi)) for gi, group in enumerate(groups)]
+        await self.stop.wait()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _ws_group_loop(self, host: str, streams: list[str], group_i: int) -> None:
         delay = 1.0
         while not self.stop.is_set():
-            streams = [
-                f"{sym.lower()}@kline_{tf}"
-                for (sym, tf) in self.watch_pairs()
-            ]
-            if not streams:
-                await asyncio.sleep(1)
-                continue
-            host = WS_HOSTS[host_i % len(WS_HOSTS)]
-            url = combined_stream_url(host, streams)
-            log.info("WebSocket connecting %s (%s streams)", host, len(streams))
             try:
-                async with websockets.connect(
-                    url,
-                    open_timeout=WS_CONNECT_TIMEOUT,
-                    ping_interval=15,
-                    ping_timeout=15,
-                    close_timeout=3,
-                    max_queue=1024,
-                ) as ws:
-                    self.ws_ok = True
-                    delay = 1.0
-                    log.info("WebSocket live on %s", host)
-                    while not self.stop.is_set():
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                        except asyncio.TimeoutError:
-                            # Stay connected; a quiet 30s is not a dead socket.
-                            continue
-                        data = json.loads(raw)
-                        payload = data.get("data") if isinstance(data, dict) else None
-                        if not payload or payload.get("e") != "kline":
-                            # combined wrapper or array
-                            if isinstance(data, dict) and "k" in data:
-                                payload = data
-                            else:
-                                continue
-                        k = payload.get("k") or {}
-                        sym = payload.get("s") or k.get("s")
-                        tf = k.get("i")
-                        if sym and tf:
-                            self.handle_kline(sym, tf, k)
+                await self._ws_one(host, streams, group_i)
+                delay = 1.0
             except Exception as e:
-                self.ws_ok = False
-                log.warning("WebSocket error on %s: %s", host, e)
-                host_i += 1
-                if host_i >= len(WS_HOSTS) and not self.polling:
-                    log.warning("All WS hosts failed — falling back to REST polling")
-                    self.polling = True
-                try:
-                    await asyncio.wait_for(self.stop.wait(), timeout=min(delay, 15))
-                except asyncio.TimeoutError:
-                    pass
-                delay = min(delay * 1.5, 15)
-
-    async def poll_loop(self) -> None:
-        interval = max(0.5, float(self.cfg["poll_interval_sec"]))
-        while not self.stop.is_set():
-            grace = (not self.ws_ok) and (time.time() - self._started > 20)
-            if self.polling or grace:
-                if not self.polling and grace:
-                    self.polling = True
-                    log.warning("WebSocket not live after 20s — REST polling fallback")
-                for (sym, tf), mkt in list(self.markets.items()):
-                    if self.stop.is_set():
-                        break
-                    try:
-                        candles = await asyncio.to_thread(self.rest.klines, sym, tf, 2)
-                    except Exception as e:
-                        log.debug("poll %s %s failed: %s", sym, tf, e)
-                        continue
-                    if not candles:
-                        continue
-                    last = candles[-1]
-                    interval_ms = INTERVAL_MS.get(tf, 60_000)
-                    closed = last["time"] * 1000 + interval_ms <= time.time() * 1000 + 500
-                    # If the last bar is still forming, the previous one just closed (or already was).
-                    if len(candles) >= 2:
-                        prev = candles[-2]
-                        if not mkt.candles or prev["time"] != mkt.candles[-1]["time"] or mkt.candles[-1]["close"] != prev["close"]:
-                            if not mkt.candles or prev["time"] >= (mkt.candles[-1]["time"] if mkt.candles else 0):
-                                if not mkt.candles or prev["time"] > mkt.candles[-1]["time"]:
-                                    log.info("closed candle %s %s %s close=%s", mkt.symbol, mkt.tf, fmt_jakarta(prev["time"]), fmt_price(prev["close"]))
-                        pack = mkt.upsert(prev, True)
-                        if pack:
-                            self.on_pack(mkt, pack, True)
-                    pack = mkt.upsert(last, closed)
-                    if pack:
-                        self.on_pack(mkt, pack, True)
-                if not self.ws_ok:
-                    if not self.polling:
-                        self.polling = True
-                        log.info("Live (polling)")
+                self._ws_disconnects += 1
+                if time.time() - self._ws_kline_at > 5:
+                    self.ws_ok = False
+                log.warning("WebSocket error on %s group=%s: %s", host, group_i, e)
+            if self.stop.is_set():
+                return
             try:
-                await asyncio.wait_for(self.stop.wait(), timeout=interval)
+                await asyncio.wait_for(self.stop.wait(), timeout=min(delay, 5))
             except asyncio.TimeoutError:
                 pass
+            delay = min(delay * 1.5, 5)
+
+    async def _ws_one(self, host: str, streams: list[str], group_i: int) -> None:
+        import websockets
+        url = combined_stream_url(host, streams)
+        async with websockets.connect(
+            url,
+            open_timeout=WS_CONNECT_TIMEOUT,
+            ping_interval=WS_PING_INTERVAL,
+            ping_timeout=WS_PING_TIMEOUT,
+            close_timeout=3,
+            max_queue=2048,
+        ) as ws:
+            delay_ok = 1.0
+            log.info("WebSocket live on %s group=%s streams=%s", host, group_i, len(streams))
+            saw_kline = False
+            connected_at = time.time()
+            while not self.stop.is_set():
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                except asyncio.TimeoutError:
+                    # A quiet interval can happen. Reconnect only once the
+                    # socket has gone stale (no kline for WS_STALE_RECONNECT_SEC).
+                    last = self._ws_kline_at if saw_kline else connected_at
+                    if time.time() - last > WS_STALE_RECONNECT_SEC:
+                        raise RuntimeError(
+                            f"no kline frames for {int(time.time() - last)}s on group {group_i}"
+                        )
+                    continue
+                data = json.loads(raw)
+                payload = data.get("data") if isinstance(data, dict) else None
+                if not payload or payload.get("e") != "kline":
+                    if isinstance(data, dict) and "k" in data:
+                        payload = data
+                    else:
+                        continue
+                k = payload.get("k") or {}
+                sym = payload.get("s") or k.get("s")
+                tf = k.get("i")
+                if not (sym and tf):
+                    continue
+                self._ws_msgs += 1
+                self._ws_kline_at = time.time()
+                if not saw_kline:
+                    saw_kline = True
+                    self.ws_ok = True
+                    log.info("WebSocket first kline on group %s (%s %s)", group_i, sym, tf)
+                self.handle_kline(sym, tf, k)
+
+    async def poll_loop(self) -> None:
+        """REST catch-up for closed bars the WebSocket missed or never sent.
+
+        On this box the futures socket often completes the handshake but
+        delivers no kline frames, so REST must still catch closes — but it
+        stays off the critical path of markets that are already up to date,
+        and fetches only the lagging ones in parallel.
+        """
+        while not self.stop.is_set():
+            now = time.time()
+            due: list[tuple[str, str]] = []
+            for (sym, tf), mkt in list(self.markets.items()):
+                if self.stop.is_set():
+                    break
+                interval = INTERVAL_MS.get(tf, 60_000) / 1000.0
+                last_open = last_closed_open_time(tf, now)
+                if now < last_open + interval + CATCHUP_AFTER_CLOSE_SEC:
+                    continue
+                have_closed = int(mkt._last_closed_key[0]) if mkt._last_closed_key else 0
+                if have_closed >= last_open:
+                    continue
+                due.append((sym, tf))
+            if due:
+                jobs: list[tuple[str, str, int]] = []
+                for sym, tf in due:
+                    mkt = self.markets.get((sym, tf))
+                    have = int(mkt.candles[-1]["time"]) if mkt and mkt.candles else 0
+                    interval = INTERVAL_MS.get(tf, 60_000) / 1000.0
+                    last_open = last_closed_open_time(tf, now)
+                    missing = max(1, int((last_open - have) / interval) if have else 1)
+                    jobs.append((sym, tf, min(200, missing + 2)))
+                await self._catchup_due(jobs)
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _catchup_due(self, due: list[tuple[str, str, int]]) -> None:
+        loop = asyncio.get_running_loop()
+
+        def one(sym: str, tf: str, limit: int):
+            try:
+                return sym, tf, urllib_klines(sym, tf, limit, CATCHUP_TRIES), None
+            except Exception as e:
+                return sym, tf, None, e
+
+        futs = [loop.run_in_executor(self._catchup_pool, one, sym, tf, limit) for sym, tf, limit in due]
+        rows = await asyncio.gather(*futs, return_exceptions=True)
+        for item in rows:
+            if isinstance(item, Exception):
+                log.debug("catch-up worker failed: %s", item)
+                continue
+            sym, tf, candles, err = item
+            if err is not None:
+                log.debug("poll %s %s failed: %s", sym, tf, err)
+                continue
+            mkt = self.markets.get((sym, tf))
+            if not mkt or not candles:
+                continue
+            self._apply_closed_bars(mkt, candles, "rest")
 
     async def topn_loop(self) -> None:
         while not self.stop.is_set():
@@ -955,7 +1141,10 @@ class SignalBot:
         )
         self.refresh_universe()
         self.seed_all()
-        self.polling = True  # keep REST backup on; WS on this box can sit idle without kline frames
+        # REST catch-up always runs, but only for markets whose last closed
+        # bar is missing. Confirmed signals come from WS x=true when frames
+        # arrive, otherwise from this catch-up within a few seconds of close.
+        self.polling = True
         log.info("History seeded. Watching for new confirmed signals (alert-only, no trading).")
         tasks = [
             asyncio.create_task(self.connect_ws_loop(), name="ws"),
@@ -966,8 +1155,15 @@ class SignalBot:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            self._catchup_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         self.state.save()
-        log.info("Stopped.")
+        log.info(
+            "Stopped. ws_msgs=%s ws_disconnects=%s",
+            self._ws_msgs, self._ws_disconnects,
+        )
 
 
 def setup_logging() -> None:
