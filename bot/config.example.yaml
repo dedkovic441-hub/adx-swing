@@ -46,3 +46,9 @@ chart_url: https://dedkovic441-hub.github.io/adx-swing/
 
 # REST polling interval (also used as a backup while the WebSocket is live)
 poll_interval_sec: 15
+
+# Unconfirmed paper account: a faded BUY?/SELL? keeps the position open.
+# A later same-direction unconfirmed signal adds another leg sized to the
+# first leg's notional. max_add_positions is additional legs (4 → 5 total).
+unconfirmed:
+  max_add_positions: 4

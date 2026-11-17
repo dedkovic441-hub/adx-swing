@@ -743,7 +743,9 @@ class SignalBot:
         """Paper + alerts_unconfirmed.jsonl for forming BUY?/SELL? on closed candles.
 
         Historic provisionals are recorded at seed and not traded. A later
-        confirmation of the same pivot is not treated as a repaint.
+        confirmation of the same pivot is not treated as a repaint. A fade
+        (forming pivot disappears) keeps the unconfirmed paper position open;
+        a later new same-direction unconfirmed signal may add a leg.
         """
         key = (mkt.symbol, mkt.tf)
         prev = self._last_prov.get(key)
@@ -765,7 +767,7 @@ class SignalBot:
                     )
                 elif fill is not None:
                     paper_engine.close_unconfirmed_repainted(mkt.symbol, mkt.tf, fill)
-            # same-side pivot walk: keep the open position, do not re-alert
+            # same-side pivot walk (no intervening fade): keep the open position, do not re-alert
         except Exception as e:
             log.error("unconfirmed paper/alert failed %s %s: %s", mkt.symbol, mkt.tf, e)
         self._last_prov[key] = curr
