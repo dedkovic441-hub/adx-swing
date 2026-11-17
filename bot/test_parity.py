@@ -2,7 +2,7 @@
 """Compare Python swing signals to the JavaScript engine on the same USD-M klines.
 
 Klines are loaded from Binance USD-M Futures REST (`/fapi/v1/klines`). That host
-answers HTTP 451 from some regions; in that case the same candles are read from
+answers HTTP 451 or CloudFront 403 from some regions; in that case the same candles are read from
 the public USD-M archive on data.binance.vision, which is the published copy of
 `/fapi/v1/klines`.
 """
@@ -127,9 +127,11 @@ def fetch_klines(symbol: str, tf: str, dest: Path) -> None:
     try:
         raw = client.get(path, bulky=True)
     except Exception as e:
-        if not client.saw_restricted:
+        msg = str(e)
+        blocked = client.saw_restricted or "403" in msg or "451" in msg
+        if not blocked:
             raise RuntimeError(f"could not fetch {symbol} {tf}: {e}") from e
-        print(f"  fapi.binance.com is restricted here; using the USD-M kline archive for {symbol} {tf}")
+        print(f"  fapi.binance.com blocked here ({e}); using the USD-M kline archive for {symbol} {tf}")
         raw = fetch_vision_klines(symbol, tf, 1000)
     dest.write_text(json.dumps(raw), encoding="utf-8")
 

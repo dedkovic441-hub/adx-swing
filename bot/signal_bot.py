@@ -12,6 +12,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -22,9 +23,12 @@ if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
 from swing import INTERVAL_MS, detect_swing_signals  # noqa: E402
+import paper_engine  # noqa: E402
 
 JAKARTA = ZoneInfo("Asia/Jakarta")
 CHART_DEFAULT = "https://dedkovic441-hub.github.io/adx-swing/"
+ALERTS_JSONL = Path("/workspace/adx-swing-bot/alerts.jsonl")
+ALERTS_UNCONFIRMED_JSONL = Path("/workspace/adx-swing-bot/alerts_unconfirmed.jsonl")
 
 # Same USD-M Futures hosts as index.html. Public market data only.
 REST_BASES = [
@@ -39,8 +43,8 @@ REST_TIMEOUT = 4
 REST_TIMEOUT_BULKY = 8
 # fapi.binance.com sits behind CloudFront and sometimes answers HTTP 403
 # for a moment, then accepts the same request. Retry that host before failover.
-REST_403_ATTEMPTS = 3
-REST_403_BACKOFF_SEC = 0.3
+REST_403_ATTEMPTS = 5
+REST_403_BACKOFF_SEC = 0.2
 WS_HOSTS = [
     "wss://fstream.binance.com",
 ]
@@ -245,9 +249,21 @@ class RestClient:
         self.current: Optional[str] = remembered if remembered in REST_BASES else None
         self.saw_restricted = False
         self._sleep = time.sleep
+        self._new_session()
+
+    def _new_session(self) -> None:
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "coin-chart-signal-bot/7.1"
         self.session.headers["Accept"] = "application/json"
+
+    def _urllib_get(self, url: str, timeout: float):
+        import urllib.request
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "coin-chart-signal-bot/7.1", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
 
     def get(self, path: str, timeout: Optional[float] = None, bulky: bool = False) -> Any:
         timeout = timeout or (REST_TIMEOUT_BULKY if bulky else REST_TIMEOUT)
@@ -255,6 +271,10 @@ class RestClient:
         if self.current and self.current in order:
             order.remove(self.current)
             order.insert(0, self.current)
+        # Prefer the primary host; fapi1-4 often return 202/302 from this box.
+        if "https://fapi.binance.com" in order:
+            order.remove("https://fapi.binance.com")
+            order.insert(0, "https://fapi.binance.com")
         last_err: Optional[Exception] = None
         for base in order:
             url = base + REST_PREFIX + path
@@ -264,6 +284,11 @@ class RestClient:
                 except Exception as e:
                     last_err = e
                     log.debug("REST %s error: %s", url, e)
+                    self._new_session()
+                    self._sleep(0.5)
+                    continue
+                if r.status_code in (301, 302, 303, 202) and base != "https://fapi.binance.com":
+                    last_err = RuntimeError(f"{base} HTTP {r.status_code}")
                     break
                 if r.status_code == 403 and attempt + 1 < REST_403_ATTEMPTS:
                     delay = cloudfront_403_backoff(attempt)
@@ -276,20 +301,25 @@ class RestClient:
                     if _is_restricted(r):
                         self.saw_restricted = True
                     detail = _response_text(r).replace("\n", " ").strip()
-                    msg = f"{base} HTTP {r.status_code}"
-                    if detail:
-                        msg = f"{msg} {detail}"
-                    last_err = RuntimeError(msg)
+                    last_err = RuntimeError(f"{base} HTTP {r.status_code} {detail}".strip())
                     log.debug("REST %s failed: %s", url, last_err)
                     break
                 try:
                     payload = r.json()
                 except Exception as e:
                     last_err = e
-                    log.debug("REST %s invalid JSON: %s", url, e)
                     break
                 self.current = base
                 return payload
+        # Fresh-client fallback on the primary host (a sticky Session can stay 403).
+        url = "https://fapi.binance.com" + REST_PREFIX + path
+        try:
+            payload = self._urllib_get(url, timeout)
+            self.current = "https://fapi.binance.com"
+            return payload
+        except Exception as e:
+            last_err = e
+            log.warning("REST urllib fallback failed for %s: %s", path, e)
         raise RuntimeError(f"All REST bases failed for {path}: {last_err}")
 
     def klines(self, symbol: str, tf: str, limit: int = 1000) -> list[dict]:
@@ -331,6 +361,182 @@ class RestClient:
         return [sym for _, sym in rows[:n]]
 
 
+
+def _jsonl_key(rec: dict) -> str:
+    return f"{rec.get('symbol')}|{rec.get('timeframe')}|{rec.get('side')}|{rec.get('candle_close_utc')}"
+
+
+def _load_jsonl_keys() -> set[str]:
+    keys: set[str] = set()
+    try:
+        if ALERTS_JSONL.exists():
+            for line in ALERTS_JSONL.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    keys.add(_jsonl_key(json.loads(line)))
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return keys
+
+
+_JSONL_KEYS: set[str] | None = None
+
+
+def append_alert_jsonl(symbol: str, tf: str, sig: dict) -> None:
+    """Append one deduped confirmed BUY/SELL line for the forwarder routine."""
+    global _JSONL_KEYS
+    if sig.get("provisional"):
+        return
+    side = sig.get("name") or ("BUY" if sig.get("dir") == "bull" else "SELL")
+    if side not in {"BUY", "SELL"}:
+        return
+    open_s = int(sig.get("confirmTime") or sig.get("time") or 0)
+    close_dt = datetime.fromtimestamp(open_s, tz=timezone.utc) + timedelta(milliseconds=INTERVAL_MS.get(tf, 60_000))
+    rec = {
+        "symbol": symbol,
+        "timeframe": tf,
+        "side": side,
+        "price": sig.get("price"),
+        "candle_close_utc": close_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "detected_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if _JSONL_KEYS is None:
+        _JSONL_KEYS = _load_jsonl_keys()
+    key = _jsonl_key(rec)
+    if key in _JSONL_KEYS:
+        return
+    ALERTS_JSONL.parent.mkdir(parents=True, exist_ok=True)
+    with open(ALERTS_JSONL, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    _JSONL_KEYS.add(key)
+    log.info("alerts.jsonl %s %s %s", symbol, tf, side)
+
+
+def last_closed_bar(mkt: "Market"):
+    candles = mkt.candles or []
+    return candles[-1] if candles else None
+
+
+def last_closed_close(mkt: "Market"):
+    bar = last_closed_bar(mkt)
+    try:
+        return float(bar["close"]) if bar is not None else None
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _prov_side(sig: dict | None) -> str | None:
+    if not sig:
+        return None
+    name = str(sig.get("name") or "")
+    if name.startswith("BUY"):
+        return "BUY"
+    if name.startswith("SELL"):
+        return "SELL"
+    return None
+
+
+def _prov_snapshot(sig: dict | None) -> dict | None:
+    if not sig:
+        return None
+    side = _prov_side(sig)
+    if not side:
+        return None
+    return {
+        "name": sig.get("name") or (side + "?"),
+        "side": side,
+        "price": sig.get("price"),
+        "time": sig.get("time"),
+        "id": sig.get("id"),
+        "swingKind": sig.get("swingKind"),
+    }
+
+
+def _confirmed_same_pivot(pack: dict, prev: dict | None) -> bool:
+    """True if the previous unconfirmed pivot is now a confirmed signal (not a repaint)."""
+    if not prev:
+        return False
+    want_time = prev.get("time")
+    want_side = prev.get("side")
+    for s in pack.get("signals") or []:
+        if want_time is not None and s.get("time") != want_time:
+            continue
+        if _prov_side(s) == want_side:
+            return True
+    return False
+
+
+_UNCONF_JSONL_KEYS: set[str] | None = None
+
+
+def _load_unconf_jsonl_keys() -> set[str]:
+    keys: set[str] = set()
+    try:
+        if ALERTS_UNCONFIRMED_JSONL.exists():
+            for line in ALERTS_UNCONFIRMED_JSONL.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    keys.add(_jsonl_key(json.loads(line)))
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return keys
+
+
+def append_unconfirmed_alert_jsonl(symbol: str, tf: str, sig: dict, bar: dict | None) -> None:
+    """Append one deduped unconfirmed BUY?/SELL? line. Never writes alerts.jsonl."""
+    global _UNCONF_JSONL_KEYS
+    side = sig.get("name") or ((_prov_side(sig) or "") + "?")
+    if side not in {"BUY?", "SELL?"}:
+        base = _prov_side(sig)
+        if base in {"BUY", "SELL"}:
+            side = base + "?"
+        else:
+            return
+    if bar is not None:
+        open_s = int(bar.get("time") or 0)
+        close_dt = datetime.fromtimestamp(open_s, tz=timezone.utc) + timedelta(milliseconds=INTERVAL_MS.get(tf, 60_000))
+        price = bar.get("close", sig.get("price"))
+    else:
+        open_s = int(sig.get("time") or 0)
+        close_dt = datetime.fromtimestamp(open_s, tz=timezone.utc) + timedelta(milliseconds=INTERVAL_MS.get(tf, 60_000))
+        price = sig.get("price")
+    rec = {
+        "symbol": symbol,
+        "timeframe": tf,
+        "side": side,
+        "price": price,
+        "pivot_price": sig.get("price"),
+        "pivot_time": sig.get("time"),
+        "candle_close_utc": close_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "detected_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if _UNCONF_JSONL_KEYS is None:
+        _UNCONF_JSONL_KEYS = _load_unconf_jsonl_keys()
+    key = _jsonl_key(rec)
+    if key in _UNCONF_JSONL_KEYS:
+        return
+    ALERTS_UNCONFIRMED_JSONL.parent.mkdir(parents=True, exist_ok=True)
+    with open(ALERTS_UNCONFIRMED_JSONL, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    _UNCONF_JSONL_KEYS.add(key)
+    log.info("unconfirmed %s %s %s", symbol, tf, side)
+    stamp = now_jakarta()
+    kind = sig.get("swingKind") or ("bottom" if side.startswith("BUY") else "top")
+    print(f"[{stamp}] unconfirmed {symbol} {tf} {side} @ {fmt_price(sig.get('price'))} ({kind})", flush=True)
+
+
 # --- alerts -----------------------------------------------------------------
 
 class Alerter:
@@ -346,6 +552,10 @@ class Alerter:
         text = f"[{stamp}] {prefix}{body}" if prefix else f"[{stamp}]\n{body}"
         print(text, flush=True)
         log.info("alert %s %s %s", symbol, tf, sig.get("name"))
+        try:
+            append_alert_jsonl(symbol, tf, sig)
+        except Exception as e:
+            log.error("alerts.jsonl write failed: %s", e)
         if self.enabled:
             self._telegram(text)
 
@@ -397,6 +607,19 @@ class Market:
 
 # --- bot --------------------------------------------------------------------
 
+def confirmation_close(mkt: "Market", sig: dict):
+    """Close of the confirmation candle; fall back to the last closed bar."""
+    want = int(sig.get("confirmTime") or 0)
+    close = None
+    for c in mkt.candles or []:
+        if int(c.get("time") or 0) == want:
+            close = float(c["close"])
+            break
+    if close is None and mkt.candles:
+        close = float(mkt.candles[-1]["close"])
+    return close
+
+
 class SignalBot:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -411,6 +634,7 @@ class SignalBot:
         self.ws_ok = False
         self._started = time.time()
         self._streams: list[str] = []
+        self._last_prov: dict[tuple[str, str], dict | None] = {}
 
     def watch_pairs(self) -> list[tuple[str, str]]:
         return sorted(self.markets.keys())
@@ -442,7 +666,18 @@ class SignalBot:
     def seed_all(self) -> None:
         for (sym, tf), mkt in list(self.markets.items()):
             try:
-                candles = self.rest.klines(sym, tf, 1000)
+                candles = None
+                last_err = None
+                for attempt in range(6):
+                    try:
+                        candles = self.rest.klines(sym, tf, 1000)
+                        break
+                    except Exception as e:
+                        last_err = e
+                        log.warning("seed retry %s %s (%s/6): %s", sym, tf, attempt + 1, e)
+                        time.sleep(2.0 * (attempt + 1))
+                if candles is None:
+                    raise last_err
                 pack = mkt.seed(candles)
                 sigs = pack["signals"]
                 last = sigs[-1] if sigs else None
@@ -458,6 +693,7 @@ class SignalBot:
                     self.state.mark(signal_key(sym, tf, s), {"name": s["name"], "price": s["price"], "time": s["time"]})
                 if pack.get("provisional"):
                     self.state.mark(signal_key(sym, tf, pack["provisional"], True))
+                self._last_prov[(sym, tf)] = _prov_snapshot(pack.get("provisional"))
             except Exception as e:
                 log.error("seed failed %s %s: %s", sym, tf, e)
         self.state.rest_base = self.rest.current
@@ -486,6 +722,13 @@ class SignalBot:
             self.alerter.emit(mkt.symbol, mkt.tf, s)
             self.state.mark(key, {"name": s["name"], "price": s["price"], "time": s["time"]})
             dirty = True
+            try:
+                fill = confirmation_close(mkt, s)
+                if fill is not None:
+                    paper_engine.on_signal(mkt.symbol, mkt.tf, s.get("name") or "", fill)
+            except Exception as e:
+                log.error("paper trade failed %s %s: %s", mkt.symbol, mkt.tf, e)
+        self._handle_unconfirmed(mkt, pack)
         if self.cfg["provisional_alerts"] and pack.get("provisional"):
             p = pack["provisional"]
             key = signal_key(mkt.symbol, mkt.tf, p, True)
@@ -495,6 +738,37 @@ class SignalBot:
                 dirty = True
         if dirty:
             self.state.save()
+
+    def _handle_unconfirmed(self, mkt: Market, pack: dict) -> None:
+        """Paper + alerts_unconfirmed.jsonl for forming BUY?/SELL? on closed candles.
+
+        Historic provisionals are recorded at seed and not traded. A later
+        confirmation of the same pivot is not treated as a repaint.
+        """
+        key = (mkt.symbol, mkt.tf)
+        prev = self._last_prov.get(key)
+        curr = _prov_snapshot(pack.get("provisional"))
+        fill = last_closed_close(mkt)
+        bar = last_closed_bar(mkt)
+        prev_side = prev.get("side") if prev else None
+        curr_side = curr.get("side") if curr else None
+        try:
+            if curr and prev_side != curr_side:
+                if fill is not None:
+                    paper_engine.on_unconfirmed_signal(mkt.symbol, mkt.tf, curr["name"], fill)
+                append_unconfirmed_alert_jsonl(mkt.symbol, mkt.tf, pack.get("provisional") or curr, bar)
+            elif prev and not curr:
+                if _confirmed_same_pivot(pack, prev):
+                    log.info(
+                        "unconfirmed %s %s %s confirmed — keeping paper position",
+                        mkt.symbol, mkt.tf, prev.get("name") or prev_side,
+                    )
+                elif fill is not None:
+                    paper_engine.close_unconfirmed_repainted(mkt.symbol, mkt.tf, fill)
+            # same-side pivot walk: keep the open position, do not re-alert
+        except Exception as e:
+            log.error("unconfirmed paper/alert failed %s %s: %s", mkt.symbol, mkt.tf, e)
+        self._last_prov[key] = curr
 
     def handle_kline(self, symbol: str, tf: str, k: dict) -> None:
         mkt = self.markets.get((symbol, tf))
@@ -540,11 +814,14 @@ class SignalBot:
                     max_queue=1024,
                 ) as ws:
                     self.ws_ok = True
-                    self.polling = False
                     delay = 1.0
                     log.info("WebSocket live on %s", host)
                     while not self.stop.is_set():
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        except asyncio.TimeoutError:
+                            # Stay connected; a quiet 30s is not a dead socket.
+                            continue
                         data = json.loads(raw)
                         payload = data.get("data") if isinstance(data, dict) else None
                         if not payload or payload.get("e") != "kline":
@@ -595,6 +872,10 @@ class SignalBot:
                     # If the last bar is still forming, the previous one just closed (or already was).
                     if len(candles) >= 2:
                         prev = candles[-2]
+                        if not mkt.candles or prev["time"] != mkt.candles[-1]["time"] or mkt.candles[-1]["close"] != prev["close"]:
+                            if not mkt.candles or prev["time"] >= (mkt.candles[-1]["time"] if mkt.candles else 0):
+                                if not mkt.candles or prev["time"] > mkt.candles[-1]["time"]:
+                                    log.info("closed candle %s %s %s close=%s", mkt.symbol, mkt.tf, fmt_jakarta(prev["time"]), fmt_price(prev["close"]))
                         pack = mkt.upsert(prev, True)
                         if pack:
                             self.on_pack(mkt, pack, True)
@@ -650,6 +931,7 @@ class SignalBot:
         )
         self.refresh_universe()
         self.seed_all()
+        self.polling = True  # keep REST backup on; WS on this box can sit idle without kline frames
         log.info("History seeded. Watching for new confirmed signals (alert-only, no trading).")
         tasks = [
             asyncio.create_task(self.connect_ws_loop(), name="ws"),

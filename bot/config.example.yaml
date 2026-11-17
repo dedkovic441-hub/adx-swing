@@ -3,10 +3,29 @@
 #   export TELEGRAM_BOT_TOKEN="..."
 #   export TELEGRAM_CHAT_ID="..."
 
+# 20 mid-cap Binance USD-M USDT perpetuals (24h quote-volume ranks ~15–60,
+# excluding BTC, ETH, top majors and stablecoins). Refresh as the book changes.
 symbols:
+  - AKEUSDT
+  - ASTERUSDT
+  - ENAUSDT
+  - JCTUSDT
+  - HUMAUSDT
+  - UNIUSDT
+  - SPACEUSDT
+  - AAVEUSDT
+  - WLDUSDT
+  - XMRUSDT
+  - SKRUSDT
+  - INJUSDT
+  - PAXGUSDT
+  - SOPHUSDT
+  - BULLAUSDT
+  - BTWUSDT
   - PUMPUSDT
-  - BTCUSDT
-  - ETHUSDT
+  - ARIAUSDT
+  - TAOUSDT
+  - INITUSDT
 
 timeframes:
   - 5m
@@ -15,7 +34,8 @@ timeframes:
 # low | medium | high  (same thresholds as the v7 chart)
 sensitivity: medium
 
-# Alert faded BUY?/SELL? developing pivots (off in the chart's "show forming" sense)
+# Telegram-style alerts for faded BUY?/SELL? developing pivots.
+# Unconfirmed paper trading and alerts_unconfirmed.jsonl run regardless.
 provisional_alerts: false
 
 # 0 = only the symbols list. If > 0, also watch the top N USD-M perpetual USDT pairs by 24h quote volume.
@@ -24,5 +44,5 @@ top_n_by_volume: 0
 state_file: state.json
 chart_url: https://dedkovic441-hub.github.io/adx-swing/
 
-# REST polling interval when the WebSocket is down
-poll_interval_sec: 1
+# REST polling interval (also used as a backup while the WebSocket is live)
+poll_interval_sec: 15

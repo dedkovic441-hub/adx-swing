@@ -5,3 +5,7 @@ state.json
 .venv/
 __pycache__/
 *.pyc
+*.jsonl
+paper_state*.json
+forwarded.json
+*.log

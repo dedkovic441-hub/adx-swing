@@ -129,6 +129,21 @@ The Python engine is checked against the JavaScript in `index.html` on the same 
 python3 bot/test_parity.py
 ```
 
+## Supervisor scripts
+
+From the repo root, `run/start.sh`, `run/stop.sh`, and `run/supervisor.sh` start the bot with `--no-telegram` unless those environment variables are already set. Logs and pid files stay under `run/` (gitignored).
+
+## Paper trading and alert logs
+
+Two isolated *paper* (simulated) accounts, no Binance keys or real orders:
+
+- **Confirmed** — `paper_state.json` / `paper_trades.jsonl`. Enters at the confirmation-candle close when a new non-repainting BUY/SELL appears.
+- **Unconfirmed (repaints)** — `paper_state_unconfirmed.json` / `paper_trades_unconfirmed.jsonl`. Enters at the close of the candle when a new forming BUY?/SELL? first appears; flips on the opposite unconfirmed signal; exits as `repainted` if that forming pivot disappears.
+
+Defaults: $1,000 virtual USDT, $50 notional, 1x, 0.05% taker fee per side. Historic signals are not back-filled on startup.
+
+Confirmed alerts are appended to `alerts.jsonl` (what the forwarder routine reads). Unconfirmed BUY?/SELL? appearances go only to `alerts_unconfirmed.jsonl` — they are never mixed into `alerts.jsonl`.
+
 ## Alert-only
 
-This bot never sends orders. There is no API key, no wallet, and no execution path.
+This bot never sends real orders. There is no API key, no wallet, and no live execution path. Paper trading above is simulated only.

@@ -1,0 +1,30 @@
+# Runtime / state — never commit
+state.json
+bot/state.json
+paper_state.json
+paper_state_unconfirmed.json
+paper_state*.json
+*.jsonl
+alerts.jsonl
+alerts_unconfirmed.jsonl
+paper_trades.jsonl
+paper_trades_unconfirmed.jsonl
+forwarded.json
+*.log
+.venv/
+bot/.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+bot/config.yaml
+bot/config.yml
+config.yaml
+config.yml
+
+# Supervisor runtime
+run/*.log
+run/*.pid
+run/*.lock
+run/*.tmp
+run/watchlist.txt
