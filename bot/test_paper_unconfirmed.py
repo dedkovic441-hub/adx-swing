@@ -22,6 +22,7 @@ def _engine(tmp: Path, **kwargs) -> pe.PaperEngine:
         scale_in=True,
         max_add_positions=kwargs.get("max_add_positions", 4),
         dca_every_signal_timeframes=kwargs.get("dca_every_signal_timeframes", ["15m"]),
+        active_timeframe=kwargs.get("active_timeframe", None),
     )
 
 
@@ -48,15 +49,15 @@ class UnconfirmedScaleInTests(unittest.TestCase):
     def test_fade_keeps_position_and_logs_repainted(self):
         self.eng.on_signal("AKEUSDT", "5m", "BUY?", 10.0)
         st = self.eng.load()
-        pos = st["positions"]["AKEUSDT:5m"]
+        pos = st["positions"]["AKEUSDT"]
         bal_after_open = st["balance"]
         self.assertEqual(pos["leg_count"], 1)
         self.assertFalse(pos["faded"])
 
         self.eng.close_repainted("AKEUSDT", "5m", 9.5)
         st = self.eng.load()
-        self.assertIn("AKEUSDT:5m", st["positions"])
-        pos = st["positions"]["AKEUSDT:5m"]
+        self.assertIn("AKEUSDT", st["positions"])
+        pos = st["positions"]["AKEUSDT"]
         self.assertTrue(pos["faded"])
         self.assertEqual(pos["fade_count"], 1)
         self.assertEqual(pos["qty"], 50.0 / 10.0)
@@ -80,7 +81,7 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         self.eng.on_signal("FOOUSDT", "5m", "BUY?", 4.0)
 
         st = self.eng.load()
-        pos = st["positions"]["FOOUSDT:5m"]
+        pos = st["positions"]["FOOUSDT"]
         self.assertEqual(pos["first_notional"], 30.0)
         self.assertEqual(pos["leg_count"], 2)
         self.assertEqual(pos["notional"], 60.0)
@@ -98,7 +99,7 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         self.eng.on_signal("BARUSDT", "5m", "BUY?", 10.0)
         self.eng.on_signal("BARUSDT", "5m", "BUY?", 11.0)
         st = self.eng.load()
-        pos = st["positions"]["BARUSDT:5m"]
+        pos = st["positions"]["BARUSDT"]
         self.assertEqual(pos["leg_count"], 1)
         self.assertEqual(pos["notional"], 50.0)
         self.assertEqual([t["action"] for t in _trades(self.eng)], ["OPEN"])
@@ -109,14 +110,14 @@ class UnconfirmedScaleInTests(unittest.TestCase):
             self.eng.close_repainted("CAPUSDT", "15m", px + 0.1)
             self.eng.on_signal("CAPUSDT", "15m", "SELL?", px)
         st = self.eng.load()
-        pos = st["positions"]["CAPUSDT:15m"]
+        pos = st["positions"]["CAPUSDT"]
         self.assertEqual(pos["leg_count"], 5)
         self.assertEqual(pos["notional"], 250.0)
         # Sixth same-direction after another fade is ignored
         self.eng.close_repainted("CAPUSDT", "15m", 14.5)
         self.eng.on_signal("CAPUSDT", "15m", "SELL?", 14.0)
         st = self.eng.load()
-        pos = st["positions"]["CAPUSDT:15m"]
+        pos = st["positions"]["CAPUSDT"]
         self.assertEqual(pos["leg_count"], 5)
         self.assertEqual(pos["notional"], 250.0)
         self.assertTrue(pos["faded"])  # fade kept; add skipped
@@ -128,7 +129,7 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         self.eng.close_repainted("BAZUSDT", "5m", 10.0)
         self.eng.on_signal("BAZUSDT", "5m", "BUY?", 12.0)
         st = self.eng.load()
-        pos = st["positions"]["BAZUSDT:5m"]
+        pos = st["positions"]["BAZUSDT"]
         avg = float(pos["entry"])
         qty = float(pos["qty"])
         entry_fee = float(pos["entry_fee"])
@@ -142,7 +143,7 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         expected_pnl = (11.0 - avg) * qty - entry_fee - exit_fee
         self.assertAlmostEqual(close["pnl"], expected_pnl)
         # New short is a fresh 1-leg position at account notional
-        pos = st["positions"]["BAZUSDT:5m"]
+        pos = st["positions"]["BAZUSDT"]
         self.assertEqual(pos["side"], "SHORT")
         self.assertEqual(pos["leg_count"], 1)
         self.assertEqual(pos["notional"], 50.0)
@@ -157,7 +158,7 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         self.eng.close_repainted("CASHUSDT", "5m", 5.0)
         self.eng.on_signal("CASHUSDT", "5m", "BUY?", 6.0)
         st = self.eng.load()
-        pos = st["positions"]["CASHUSDT:5m"]
+        pos = st["positions"]["CASHUSDT"]
         self.assertEqual(pos["leg_count"], 1)
         self.assertTrue(pos["faded"])
         self.assertEqual([t["action"] for t in _trades(self.eng)], ["OPEN", "FADED"])
@@ -184,37 +185,38 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         self.eng.close_repainted("OLDUSDT", "5m", 5.2)
         self.eng.on_signal("OLDUSDT", "5m", "BUY?", 5.5)
         st = self.eng.load()
-        pos = st["positions"]["OLDUSDT:5m"]
+        pos = st["positions"]["OLDUSDT"]
         self.assertEqual(pos["first_notional"], 50.0)
         self.assertEqual(pos["leg_count"], 2)
         self.assertEqual(len(pos["legs"]), 2)
         self.assertAlmostEqual(pos["qty"], 10.0 + 50.0 / 5.5)
 
-    def test_confirmed_engine_ignores_same_side_and_repaint_still_closes(self):
+    def test_confirmed_engine_ignores_same_side_and_fade_does_not_close(self):
         conf = pe.PaperEngine(
             state_path=self.tmp / "paper_state.json",
             trades_path=self.tmp / "paper_trades.jsonl",
             lock_path=self.tmp / "paper.lock",
             scale_in=False,
+            active_timeframe=None,
         )
         conf.on_signal("AKEUSDT", "5m", "SELL", 10.0)
         conf.on_signal("AKEUSDT", "5m", "SELL", 11.0)
         st = conf.load()
-        pos = st["positions"]["AKEUSDT:5m"]
+        pos = st["positions"]["AKEUSDT"]
         self.assertEqual(pos["entry"], 10.0)
         self.assertNotIn("legs", pos)
         conf.close_repainted("AKEUSDT", "5m", 9.0)
         st = conf.load()
-        self.assertEqual(st["positions"], {})
-        self.assertEqual(st["closed_count"], 1)
-        self.assertEqual(_trades(conf)[-1]["action"], "CLOSE")
-        self.assertEqual(_trades(conf)[-1]["reason"], "repainted")
+        self.assertIn("AKEUSDT", st["positions"])
+        self.assertEqual(st["positions"]["AKEUSDT"]["entry"], 10.0)
+        self.assertEqual(st["closed_count"], 0)
+        self.assertEqual([t["action"] for t in _trades(conf)], ["OPEN"])
 
     def test_15m_dca_adds_without_fade(self):
         self.eng.on_signal("DCAUSDT", "15m", "SELL?", 10.0)
         self.eng.on_signal("DCAUSDT", "15m", "SELL?", 9.0)
         st = self.eng.load()
-        pos = st["positions"]["DCAUSDT:15m"]
+        pos = st["positions"]["DCAUSDT"]
         self.assertEqual(pos["leg_count"], 2)
         self.assertEqual(pos["notional"], 100.0)
         self.assertEqual(pos["first_notional"], 50.0)
@@ -230,7 +232,7 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         self.eng.save(st)
         self.eng.on_signal("DCA30USDT", "15m", "BUY?", 3.0)
         self.eng.on_signal("DCA30USDT", "15m", "BUY?", 4.0)
-        pos = self.eng.load()["positions"]["DCA30USDT:15m"]
+        pos = self.eng.load()["positions"]["DCA30USDT"]
         self.assertEqual(pos["first_notional"], 30.0)
         self.assertEqual(pos["notional"], 60.0)
         self.assertEqual(pos["leg_count"], 2)
@@ -239,11 +241,11 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         self.eng.on_signal("CAP15USDT", "15m", "SELL?", 20.0)
         for px in (19.0, 18.0, 17.0, 16.0, 15.0):
             self.eng.on_signal("CAP15USDT", "15m", "SELL?", px)
-        pos = self.eng.load()["positions"]["CAP15USDT:15m"]
+        pos = self.eng.load()["positions"]["CAP15USDT"]
         self.assertEqual(pos["leg_count"], 5)
         self.assertEqual(pos["notional"], 250.0)
         self.eng.on_signal("CAP15USDT", "15m", "SELL?", 14.0)
-        pos = self.eng.load()["positions"]["CAP15USDT:15m"]
+        pos = self.eng.load()["positions"]["CAP15USDT"]
         self.assertEqual(pos["leg_count"], 5)
         adds = [t for t in _trades(self.eng) if t["action"] == "ADD"]
         self.assertEqual(len(adds), 4)
@@ -251,7 +253,7 @@ class UnconfirmedScaleInTests(unittest.TestCase):
     def test_5m_still_requires_fade_even_when_15m_dca_enabled(self):
         self.eng.on_signal("FIVEUSDT", "5m", "BUY?", 10.0)
         self.eng.on_signal("FIVEUSDT", "5m", "BUY?", 11.0)
-        pos = self.eng.load()["positions"]["FIVEUSDT:5m"]
+        pos = self.eng.load()["positions"]["FIVEUSDT"]
         self.assertEqual(pos["leg_count"], 1)
         self.assertEqual([t["action"] for t in _trades(self.eng)], ["OPEN"])
 
@@ -284,6 +286,125 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         cfg.write_text("symbols: [AKEUSDT]\n", encoding="utf-8")
         self.assertEqual(pe.load_unconfirmed_dca_timeframes(cfg), ["15m"])
         self.assertEqual(pe.load_unconfirmed_dca_timeframes(self.tmp / "missing.yaml"), ["15m"])
+
+
+class ActiveTimeframeAndOnePerCoinTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _eng(self, **kwargs):
+        return _engine(self.tmp, **kwargs)
+
+    def test_load_active_timeframe_from_yaml(self):
+        cfg = self.tmp / "config.yaml"
+        cfg.write_text("paper:\n  active_timeframe: 5m\n", encoding="utf-8")
+        self.assertEqual(pe.load_active_timeframe(cfg), "5m")
+        cfg.write_text("paper_active_timeframe: 1h\n", encoding="utf-8")
+        self.assertEqual(pe.load_active_timeframe(cfg), "1h")
+        cfg.write_text("symbols: [AKEUSDT]\n", encoding="utf-8")
+        self.assertEqual(pe.load_active_timeframe(cfg), "15m")
+        self.assertEqual(pe.load_active_timeframe(self.tmp / "missing.yaml"), "15m")
+
+    def test_non_active_timeframe_signal_does_not_trade(self):
+        eng = self._eng(active_timeframe="15m")
+        eng.on_signal("AAAUSDT", "5m", "BUY?", 10.0)
+        st = eng.load()
+        self.assertEqual(st["positions"], {})
+        self.assertEqual(_trades(eng), [])
+
+    def test_one_position_per_coin_and_opposite_flips(self):
+        eng = self._eng(active_timeframe="15m")
+        eng.on_signal("BBBUSDT", "15m", "BUY?", 10.0)
+        st = eng.load()
+        self.assertEqual(list(st["positions"]), ["BBBUSDT"])
+        self.assertEqual(st["positions"]["BBBUSDT"]["side"], "LONG")
+        # 5m opposite is ignored (not the active TF)
+        eng.on_signal("BBBUSDT", "5m", "SELL?", 9.0)
+        st = eng.load()
+        self.assertEqual(st["positions"]["BBBUSDT"]["side"], "LONG")
+        self.assertEqual(st["closed_count"], 0)
+        # 15m opposite closes and flips
+        eng.on_signal("BBBUSDT", "15m", "SELL?", 11.0)
+        st = eng.load()
+        pos = st["positions"]["BBBUSDT"]
+        self.assertEqual(pos["side"], "SHORT")
+        self.assertEqual(pos["entry"], 11.0)
+        self.assertEqual(pos["leg_count"], 1)
+        self.assertEqual(st["closed_count"], 1)
+        close = [t for t in _trades(eng) if t["action"] == "CLOSE"][0]
+        self.assertEqual(close["reason"], "opposite_signal")
+
+    def test_5m_fade_does_not_mark_15m_position(self):
+        eng = self._eng(active_timeframe="15m")
+        eng.on_signal("CCCUSDT", "15m", "BUY?", 10.0)
+        eng.close_repainted("CCCUSDT", "5m", 9.5)
+        pos = eng.load()["positions"]["CCCUSDT"]
+        self.assertFalse(pos["faded"])
+        self.assertEqual(pos["fade_count"], 0)
+
+    def test_15m_fade_marks_but_does_not_close(self):
+        eng = self._eng(active_timeframe="15m")
+        eng.on_signal("DDDUSDT", "15m", "BUY?", 10.0)
+        eng.close_repainted("DDDUSDT", "15m", 9.5)
+        st = eng.load()
+        pos = st["positions"]["DDDUSDT"]
+        self.assertTrue(pos["faded"])
+        self.assertEqual(st["closed_count"], 0)
+        self.assertEqual([t["action"] for t in _trades(eng)], ["OPEN", "FADED"])
+
+    def test_migrate_closes_non_active_and_rekeys(self):
+        eng = self._eng(active_timeframe="15m")
+        st = eng.load()
+        st["balance"] = 999.95
+        st["fees_paid"] = 0.05
+        st["positions"] = {
+            "FOOUSDT:5m": {
+                "symbol": "FOOUSDT", "timeframe": "5m", "side": "LONG",
+                "qty": 5.0, "entry": 10.0, "notional": 50.0, "margin": 50.0,
+                "entry_fee": 0.025,
+                "opened_at_utc": "2026-11-17T01:00:00Z",
+                "opened_at_wib": "2026-11-17 08:00:00 Asia/Jakarta",
+            },
+            "FOOUSDT:15m": {
+                "symbol": "FOOUSDT", "timeframe": "15m", "side": "SHORT",
+                "qty": 4.0, "entry": 12.5, "notional": 50.0, "margin": 50.0,
+                "entry_fee": 0.025,
+                "opened_at_utc": "2026-11-17T02:00:00Z",
+                "opened_at_wib": "2026-11-17 09:00:00 Asia/Jakarta",
+            },
+            "BARUSDT:5m": {
+                "symbol": "BARUSDT", "timeframe": "5m", "side": "SHORT",
+                "qty": 10.0, "entry": 5.0, "notional": 50.0, "margin": 50.0,
+                "entry_fee": 0.025,
+                "opened_at_utc": "2026-11-17T03:00:00Z",
+                "opened_at_wib": "2026-11-17 10:00:00 Asia/Jakarta",
+            },
+        }
+        eng.save(st)
+        recs = eng.migrate_to_active_timeframe({"FOOUSDT": 11.0, "BARUSDT": 4.0})
+        self.assertEqual(len(recs), 2)
+        self.assertTrue(all(r["reason"] == "timeframe_off" for r in recs))
+        reasons = {(r["symbol"], r["timeframe"], r["side"]): r for r in recs}
+        self.assertIn(("FOOUSDT", "5m", "LONG"), reasons)
+        self.assertIn(("BARUSDT", "5m", "SHORT"), reasons)
+        # LONG FOO 10 -> 11: gross +5, minus fees
+        foo = reasons[("FOOUSDT", "5m", "LONG")]
+        self.assertAlmostEqual(foo["gross_pnl"], (11.0 - 10.0) * 5.0)
+        st = eng.load()
+        self.assertEqual(set(st["positions"]), {"FOOUSDT"})
+        pos = st["positions"]["FOOUSDT"]
+        self.assertEqual(pos["side"], "SHORT")
+        self.assertEqual(pos["timeframe"], "15m")
+        self.assertEqual(st["closed_count"], 2)
+        # idempotent
+        recs2 = eng.migrate_to_active_timeframe({"FOOUSDT": 11.0, "BARUSDT": 4.0})
+        self.assertEqual(recs2, [])
+        self.assertEqual(set(eng.load()["positions"]), {"FOOUSDT"})
+
 
 
 if __name__ == "__main__":

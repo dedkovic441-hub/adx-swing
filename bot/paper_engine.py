@@ -5,17 +5,24 @@ No Binance account, API keys, or real orders. Two isolated accounts:
 Confirmed fills at the confirmation-candle close; Unconfirmed fills at
 the close of the candle when a BUY?/SELL? first appears.
 
-Unconfirmed scale-in: if that forming pivot disappears (fades/repaints),
-the open position is kept. A later same-direction unconfirmed signal on
-the same symbol+timeframe can add another leg sized to the first leg's
-notional (not a fixed account default), up to max_add_positions extra
-legs (default 4, so 5 legs total). On timeframes in
-dca_every_signal_timeframes (default 15m), every new same-direction
-unconfirmed signal adds a leg with no fade required. Other timeframes
-(default 5m) still need a fade before a same-direction add. Opposite
-unconfirmed signals still close the whole stacked position and flip.
+Each account holds at most one open position per coin, and only signals
+on paper.active_timeframe (default 15m) are traded. Signals on other
+timeframes are still alerted and logged, but do not open, add, or close.
 
-One position per symbol+timeframe: BUY opens long, SELL opens short.
+A LONG is closed only by a SHORT signal, which realizes PnL and flips
+into a new short. A SHORT is closed only by a LONG signal, which flips
+into a new long. Fade, timeout, stop, and take-profit never close a
+position. The one exception is a one-time migration that closes leftover
+positions on a non-active timeframe (reason "timeframe_off").
+
+Unconfirmed scale-in: if that forming pivot disappears (fades/repaints),
+the open position is kept and marked faded. A later same-direction
+unconfirmed signal on the active timeframe can add another leg sized to
+the first leg's notional (not a fixed account default), up to
+max_add_positions extra legs (default 4, so 5 legs total). On timeframes
+in dca_every_signal_timeframes (default 15m), every new same-direction
+unconfirmed signal adds a leg with no fade required. Other timeframes
+(default 5m) still need a fade before a same-direction add.
 
 Confirmed state/trades: paper_state.json / paper_trades.jsonl
 Unconfirmed: paper_state_unconfirmed.json / paper_trades_unconfirmed.jsonl
@@ -43,6 +50,7 @@ LEVERAGE = 1.0
 TAKER_FEE = 0.0005  # 0.05% per side
 DEFAULT_MAX_ADD_POSITIONS = 4
 DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES = ("15m",)
+DEFAULT_ACTIVE_TIMEFRAME = "15m"
 WIB = timezone(timedelta(hours=7))
 
 
@@ -58,7 +66,12 @@ def _fmt_wib(dt: datetime) -> str:
     return dt.astimezone(WIB).strftime("%Y-%m-%d %H:%M:%S Asia/Jakarta")
 
 
-def _pos_key(symbol: str, tf: str) -> str:
+def _pos_key(symbol: str, tf: str | None = None) -> str:
+    """One position per coin. `tf` is kept for call-site compatibility."""
+    return str(symbol or "").upper()
+
+
+def _legacy_pos_key(symbol: str, tf: str) -> str:
     return f"{symbol}:{tf}"
 
 
@@ -162,6 +175,46 @@ def load_unconfirmed_dca_timeframes(config_path: Optional[Path] = None) -> list[
     return list(DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES)
 
 
+def load_active_timeframe(config_path: Optional[Path] = None) -> str:
+    """Read paper.active_timeframe from config.yaml; default '15m'."""
+    try:
+        data, text, path = _load_unconfirmed_yaml(config_path)
+        if not path.exists():
+            return DEFAULT_ACTIVE_TIMEFRAME
+        if isinstance(data, dict):
+            raw = data.get("paper")
+            if isinstance(raw, dict) and raw.get("active_timeframe"):
+                tf = str(raw["active_timeframe"]).strip().lower()
+                if tf:
+                    return tf
+            if data.get("paper_active_timeframe"):
+                tf = str(data["paper_active_timeframe"]).strip().lower()
+                if tf:
+                    return tf
+        in_paper = False
+        for line in text.splitlines():
+            raw = line.split("#", 1)[0]
+            stripped = raw.strip()
+            indent = len(raw) - len(raw.lstrip())
+            if stripped.startswith("paper_active_timeframe:"):
+                tf = stripped.split(":", 1)[1].strip().strip("'\"")
+                if tf:
+                    return tf.lower()
+            if stripped.rstrip(":") == "paper" or stripped.startswith("paper:"):
+                in_paper = True
+                continue
+            if in_paper:
+                if stripped and indent == 0:
+                    in_paper = False
+                elif stripped.startswith("active_timeframe:"):
+                    tf = stripped.split(":", 1)[1].strip().strip("'\"")
+                    if tf:
+                        return tf.lower()
+    except Exception:
+        pass
+    return DEFAULT_ACTIVE_TIMEFRAME
+
+
 def default_state() -> dict:
     return {
         "starting_balance": STARTING_BALANCE,
@@ -188,6 +241,7 @@ class PaperEngine:
         scale_in: bool = False,
         max_add_positions: int = DEFAULT_MAX_ADD_POSITIONS,
         dca_every_signal_timeframes: Optional[list[str]] = None,
+        active_timeframe: Optional[str] = DEFAULT_ACTIVE_TIMEFRAME,
     ):
         self.state_path = state_path
         self.trades_path = trades_path
@@ -197,11 +251,38 @@ class PaperEngine:
         self.max_add_positions = max(0, int(max_add_positions))
         tfs = DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES if dca_every_signal_timeframes is None else dca_every_signal_timeframes
         self.dca_every_signal_timeframes = {str(t).lower() for t in tfs}
+        self.active_timeframe = str(active_timeframe).strip().lower() if active_timeframe else ""
 
     def _lock_file(self):
         fh = open(self.lock_path, "a+")
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         return fh
+
+    def _rekey_unique_positions(self, data: dict) -> None:
+        """Rename unambiguous legacy SYMBOL:tf keys to SYMBOL. Leaves collisions alone."""
+        positions = data.get("positions") or {}
+        by_sym: dict[str, list[tuple[str, dict]]] = {}
+        for k, pos in positions.items():
+            if not isinstance(pos, dict):
+                continue
+            sym = str(pos.get("symbol") or str(k).split(":")[0]).upper()
+            by_sym.setdefault(sym, []).append((k, pos))
+        new_positions: dict[str, dict] = {}
+        changed = False
+        leftovers: dict[str, dict] = {}
+        for sym, items in by_sym.items():
+            if len(items) == 1:
+                k, pos = items[0]
+                nk = _pos_key(sym)
+                new_positions[nk] = pos
+                if k != nk:
+                    changed = True
+            else:
+                for k, pos in items:
+                    leftovers[k] = pos
+        if changed:
+            leftovers.update(new_positions)
+            data["positions"] = leftovers
 
     def load(self) -> dict:
         try:
@@ -211,6 +292,7 @@ class PaperEngine:
                     for pos in (data.get("positions") or {}).values():
                         if isinstance(pos, dict):
                             self._normalize_position(pos)
+                self._rekey_unique_positions(data)
                 return data
         except Exception:
             pass
@@ -234,6 +316,144 @@ class PaperEngine:
     def _available(self, st: dict) -> float:
         locked = sum(float(p.get("margin") or 0) for p in (st.get("positions") or {}).values())
         return float(st["balance"]) - locked
+
+    def _is_tradable_tf(self, tf: str) -> bool:
+        if not self.active_timeframe:
+            return True
+        return str(tf or "").lower() == self.active_timeframe
+
+    def _find_position(
+        self, st: dict, symbol: str, tf: Optional[str] = None
+    ) -> tuple[Optional[str], Optional[dict]]:
+        """Locate the single position for a coin, accepting legacy SYMBOL:tf keys."""
+        positions = st.get("positions") or {}
+        sym = str(symbol or "").upper()
+        key = _pos_key(sym)
+        if key in positions and isinstance(positions[key], dict):
+            return key, positions[key]
+        if tf:
+            for cand in (
+                f"{symbol}:{tf}",
+                f"{sym}:{tf}",
+                f"{symbol}:{str(tf).lower()}",
+                f"{sym}:{str(tf).lower()}",
+            ):
+                if cand in positions and isinstance(positions[cand], dict):
+                    return cand, positions[cand]
+        matches: list[tuple[str, dict]] = []
+        for k, pos in positions.items():
+            if not isinstance(pos, dict):
+                continue
+            if str(pos.get("symbol") or "").upper() == sym or str(k).split(":")[0].upper() == sym:
+                matches.append((k, pos))
+        if tf:
+            tf_l = str(tf).lower()
+            for k, pos in matches:
+                if str(pos.get("timeframe") or "").lower() == tf_l:
+                    return k, pos
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            return matches[0]
+        return None, None
+
+    def _drop_position(self, st: dict, pos: dict) -> Optional[str]:
+        positions = st.setdefault("positions", {})
+        for k, p in list(positions.items()):
+            if p is pos:
+                positions.pop(k, None)
+                return k
+        key, found = self._find_position(st, pos.get("symbol") or "", pos.get("timeframe"))
+        if key:
+            positions.pop(key, None)
+            return key
+        return None
+
+    def _mark_price(self, prices: dict, symbol: str) -> Optional[float]:
+        for k in (symbol, str(symbol).upper(), str(symbol).lower()):
+            if k in prices:
+                try:
+                    px = float(prices[k])
+                    if px > 0:
+                        return px
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    def migrate_to_active_timeframe(self, prices: dict[str, float]) -> list[dict]:
+        """Close non-active-TF positions; keep one position per coin; rekey to SYMBOL.
+
+        Non-active positions are closed at the provided mark with reason
+        "timeframe_off". Extra positions on the same coin are closed with
+        reason "duplicate_symbol" (active-TF and then newest opening kept).
+        Idempotent. Returns the CLOSE records written.
+        """
+        lock = self._lock_file()
+        closed_recs: list[dict] = []
+        try:
+            st = self.load()
+            st.setdefault("positions", {})
+            now = _now_utc()
+            active = self.active_timeframe
+
+            if active:
+                for _key, pos in list((st.get("positions") or {}).items()):
+                    if not isinstance(pos, dict):
+                        continue
+                    tf = str(pos.get("timeframe") or "").lower()
+                    if tf == active:
+                        continue
+                    symbol = pos.get("symbol") or str(_key).split(":")[0]
+                    px = self._mark_price(prices, symbol)
+                    if px is None:
+                        log.warning(
+                            "paper migrate skip %s %s: no mark price for timeframe_off close",
+                            symbol, tf,
+                        )
+                        continue
+                    closed_recs.append(self._close(st, pos, px, now, reason="timeframe_off"))
+
+            by_sym: dict[str, list[tuple[str, dict]]] = {}
+            for key, pos in list((st.get("positions") or {}).items()):
+                if not isinstance(pos, dict):
+                    continue
+                sym = str(pos.get("symbol") or str(key).split(":")[0]).upper()
+                by_sym.setdefault(sym, []).append((key, pos))
+
+            for sym, items in by_sym.items():
+                if len(items) <= 1:
+                    continue
+
+                def rank(item: tuple[str, dict]) -> tuple[int, str]:
+                    _k, p = item
+                    tf = str(p.get("timeframe") or "").lower()
+                    on_active = 1 if active and tf == active else 0
+                    return (on_active, str(p.get("opened_at_utc") or ""))
+
+                ordered = sorted(items, key=rank)
+                for _key, pos in ordered[:-1]:
+                    px = self._mark_price(prices, pos.get("symbol") or sym)
+                    if px is None:
+                        log.warning("paper migrate skip duplicate %s: no mark price", sym)
+                        continue
+                    closed_recs.append(self._close(st, pos, px, now, reason="duplicate_symbol"))
+
+            new_positions: dict[str, dict] = {}
+            for key, pos in list((st.get("positions") or {}).items()):
+                if not isinstance(pos, dict):
+                    continue
+                nk = _pos_key(pos.get("symbol") or str(key).split(":")[0])
+                if nk in new_positions and new_positions[nk] is not pos:
+                    log.warning("paper migrate unexpected leftover key %s vs %s", key, nk)
+                    continue
+                new_positions[nk] = pos
+            st["positions"] = new_positions
+            st["active_timeframe"] = active or None
+            self.save(st)
+            return closed_recs
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
 
     def _normalize_position(self, pos: dict) -> dict:
         """Backfill legs / first_notional on pre-scale-in unconfirmed positions."""
@@ -418,7 +638,7 @@ class PaperEngine:
     def _close(self, st: dict, pos: dict, price: float, now: datetime, reason: str) -> dict:
         if self.scale_in:
             self._normalize_position(pos)
-        key = _pos_key(pos["symbol"], pos["timeframe"])
+        self._drop_position(st, pos)
         qty = float(pos["qty"])
         entry = float(pos["entry"])
         side = pos["side"]
@@ -433,7 +653,6 @@ class PaperEngine:
         st["closed_count"] = int(st.get("closed_count") or 0) + 1
         if pnl > 0:
             st["win_count"] = int(st.get("win_count") or 0) + 1
-        st["positions"].pop(key, None)
         rec = {
             "action": "CLOSE",
             "symbol": pos["symbol"],
@@ -465,11 +684,11 @@ class PaperEngine:
         return rec
 
     def close_repainted(self, symbol: str, tf: str, fill_price: float) -> None:
-        """Mark an unconfirmed fade. With scale_in, keep the position open."""
+        """Mark an unconfirmed fade. Never close: only an opposite signal exits."""
         try:
             price = float(fill_price)
         except (TypeError, ValueError):
-            log.warning("paper skip repaint close %s %s: bad fill price %r", symbol, tf, fill_price)
+            log.warning("paper skip fade %s %s: bad fill price %r", symbol, tf, fill_price)
             return
         if price <= 0:
             return
@@ -477,15 +696,25 @@ class PaperEngine:
         try:
             st = self.load()
             st.setdefault("positions", {})
-            pos = st["positions"].get(_pos_key(symbol, tf))
+            _key, pos = self._find_position(st, symbol, tf)
             if not pos:
+                return
+            pos_tf = str(pos.get("timeframe") or "").lower()
+            if str(tf or "").lower() != pos_tf:
+                log.info(
+                    "paper ignore fade %s %s — open position is on %s",
+                    symbol, tf, pos_tf or "?",
+                )
                 return
             now = _now_utc()
             if self.scale_in:
                 self._mark_faded(st, pos, price, now)
+                self.save(st)
             else:
-                self._close(st, pos, price, now, reason="repainted")
-            self.save(st)
+                log.info(
+                    "paper ignore fade %s %s %s — positions only exit on an opposite signal",
+                    symbol, tf, pos.get("side"),
+                )
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             lock.close()
@@ -523,13 +752,24 @@ class PaperEngine:
         return rec
 
     def on_signal(self, symbol: str, tf: str, side_name: str, fill_price: float) -> None:
-        """Apply a BUY/SELL (or BUY?/SELL?) at the given fill price."""
+        """Apply a BUY/SELL (or BUY?/SELL?) at the given fill price.
+
+        Only the active timeframe is traded. An opposite-direction signal
+        closes the open coin position and opens the new side. Same-direction
+        signals add a DCA/scale-in leg when the unconfirmed rules allow it.
+        """
         n = (side_name or "").upper().rstrip("?")
         if n == "BUY":
             want = "LONG"
         elif n == "SELL":
             want = "SHORT"
         else:
+            return
+        if not self._is_tradable_tf(tf):
+            log.info(
+                "paper skip %s %s %s — not the active timeframe (%s)",
+                symbol, tf, side_name, self.active_timeframe or "any",
+            )
             return
         try:
             price = float(fill_price)
@@ -543,14 +783,13 @@ class PaperEngine:
             st = self.load()
             st.setdefault("positions", {})
             now = _now_utc()
-            key = _pos_key(symbol, tf)
-            pos = st["positions"].get(key)
+            _key, pos = self._find_position(st, symbol)
             if pos and pos.get("side") == want:
                 if self.scale_in:
                     self._try_add_leg(st, pos, price, now)
                     self.save(st)
                 else:
-                    log.info("paper already %s %s %s — ignoring same-side signal", symbol, tf, want)
+                    log.info("paper already %s %s — ignoring same-side signal", symbol, want)
                 return
             if pos and pos.get("side") != want:
                 self._close(st, pos, price, now, reason="opposite_signal")
@@ -574,7 +813,7 @@ _UNCONF_ENGINE: Optional[PaperEngine] = None
 def get_engine() -> PaperEngine:
     global _ENGINE
     if _ENGINE is None:
-        _ENGINE = PaperEngine()
+        _ENGINE = PaperEngine(active_timeframe=load_active_timeframe())
     return _ENGINE
 
 
@@ -588,6 +827,7 @@ def get_unconfirmed_engine() -> PaperEngine:
             scale_in=True,
             max_add_positions=load_unconfirmed_max_add(),
             dca_every_signal_timeframes=load_unconfirmed_dca_timeframes(),
+            active_timeframe=load_active_timeframe(),
         )
     return _UNCONF_ENGINE
 

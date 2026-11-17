@@ -47,6 +47,13 @@ chart_url: https://dedkovic441-hub.github.io/adx-swing/
 # REST polling interval (also used as a backup while the WebSocket is live)
 poll_interval_sec: 15
 
+# Paper accounts trade only this timeframe, with one open position per coin.
+# Signals on other timeframes are still alerted and logged, but do not trade.
+# An opposite-direction signal on this timeframe closes the open trade and flips.
+# Positions are not closed on fade, timeout, stop, or take-profit.
+paper:
+  active_timeframe: 15m
+
 # Unconfirmed paper account: a faded BUY?/SELL? keeps the position open.
 # A later same-direction unconfirmed signal adds another leg sized to the
 # first leg's notional. max_add_positions is additional legs (4 → 5 total).

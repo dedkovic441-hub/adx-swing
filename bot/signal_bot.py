@@ -215,6 +215,7 @@ def load_config(path: Optional[Path]) -> dict:
         "telegram_chat": os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT") or "",
         "unconfirmed_dca_every_signal_timeframes": paper_engine.load_unconfirmed_dca_timeframes(path),
         "unconfirmed_max_add_positions": paper_engine.load_unconfirmed_max_add(path),
+        "paper_active_timeframe": paper_engine.load_active_timeframe(path),
     })
     return cfg
 
@@ -747,6 +748,52 @@ class SignalBot:
     def watch_pairs(self) -> list[tuple[str, str]]:
         return sorted(self.markets.keys())
 
+    def _is_paper_tf(self, tf: str) -> bool:
+        active = str(self.cfg.get("paper_active_timeframe") or paper_engine.DEFAULT_ACTIVE_TIMEFRAME).lower()
+        return str(tf or "").lower() == active
+
+    def collect_mark_prices(self) -> dict[str, float]:
+        """Public ticker marks (no API keys), falling back to last closed closes."""
+        prices: dict[str, float] = {}
+        want = {sym for sym, _tf in self.markets}
+        try:
+            rows = self.rest.get("/ticker/price")
+            for row in rows or []:
+                s = row.get("symbol")
+                if s in want:
+                    try:
+                        px = float(row["price"])
+                        if px > 0:
+                            prices[s] = px
+                    except (TypeError, ValueError, KeyError):
+                        pass
+        except Exception as e:
+            log.warning("mark prices ticker failed: %s", e)
+        for (sym, _tf), mkt in self.markets.items():
+            if sym in prices:
+                continue
+            px = last_closed_close(mkt)
+            if px is not None:
+                prices[sym] = px
+        return prices
+
+    def migrate_paper_accounts(self) -> None:
+        prices = self.collect_mark_prices()
+        active = self.cfg.get("paper_active_timeframe") or paper_engine.DEFAULT_ACTIVE_TIMEFRAME
+        log.info("paper active timeframe %s; migrating to one position per coin", active)
+        for label, eng in (
+            ("confirmed", paper_engine.get_engine()),
+            ("unconfirmed", paper_engine.get_unconfirmed_engine()),
+        ):
+            recs = eng.migrate_to_active_timeframe(prices)
+            log.info("paper migrate %s: closed %s position(s)", label, len(recs))
+            for rec in recs:
+                log.info(
+                    "paper migrate %s CLOSE %s %s %s entry=%s exit=%s pnl=%.5f reason=%s",
+                    label, rec.get("symbol"), rec.get("timeframe"), rec.get("side"),
+                    rec.get("entry"), rec.get("exit"), float(rec.get("pnl") or 0), rec.get("reason"),
+                )
+
     def ensure_market(self, symbol: str, tf: str) -> Market:
         key = (symbol, tf)
         if key not in self.markets:
@@ -843,9 +890,10 @@ class SignalBot:
             self.state.mark(key, {"name": s["name"], "price": s["price"], "time": s["time"]})
             dirty = True
             try:
-                fill = confirmation_close(mkt, s)
-                if fill is not None:
-                    paper_engine.on_signal(mkt.symbol, mkt.tf, s.get("name") or "", fill)
+                if self._is_paper_tf(mkt.tf):
+                    fill = confirmation_close(mkt, s)
+                    if fill is not None:
+                        paper_engine.on_signal(mkt.symbol, mkt.tf, s.get("name") or "", fill)
             except Exception as e:
                 log.error("paper trade failed %s %s: %s", mkt.symbol, mkt.tf, e)
         self._handle_unconfirmed(mkt, pack)
@@ -879,7 +927,7 @@ class SignalBot:
         curr_side = curr.get("side") if curr else None
         try:
             if curr and prev_side != curr_side:
-                if fill is not None:
+                if fill is not None and self._is_paper_tf(mkt.tf):
                     paper_engine.on_unconfirmed_signal(mkt.symbol, mkt.tf, curr["name"], fill)
                 append_unconfirmed_alert_jsonl(mkt.symbol, mkt.tf, pack.get("provisional") or curr, bar)
             elif prev and not curr:
@@ -888,7 +936,7 @@ class SignalBot:
                         "unconfirmed %s %s %s confirmed — keeping paper position",
                         mkt.symbol, mkt.tf, prev.get("name") or prev_side,
                     )
-                elif fill is not None:
+                elif fill is not None and self._is_paper_tf(mkt.tf):
                     paper_engine.close_unconfirmed_repainted(mkt.symbol, mkt.tf, fill)
             elif curr and prev and prev_side == curr_side and _is_new_unconfirmed_pivot(prev, curr):
                 dca_tfs = {
@@ -900,7 +948,7 @@ class SignalBot:
                 if mkt.tf in dca_tfs:
                     # 15m (or configured) DCA: new same-direction pivot writes a
                     # new alert and can add a leg without a fade.
-                    if fill is not None:
+                    if fill is not None and self._is_paper_tf(mkt.tf):
                         paper_engine.on_unconfirmed_signal(mkt.symbol, mkt.tf, curr["name"], fill)
                     append_unconfirmed_alert_jsonl(mkt.symbol, mkt.tf, pack.get("provisional") or curr, bar)
             # 5m / non-DCA same-side walk with no fade: keep the open position, do not re-alert
@@ -1131,16 +1179,21 @@ class SignalBot:
 
     async def run(self) -> None:
         log.info(
-            "coin-chart signal bot starting  market=USD-M  rest=%s  ws=%s  symbols=%s  tfs=%s  sensitivity=%s  telegram=%s",
+            "coin-chart signal bot starting  market=USD-M  rest=%s  ws=%s  symbols=%s  tfs=%s  paper_tf=%s  sensitivity=%s  telegram=%s",
             REST_BASES[0] + REST_PREFIX,
             WS_HOSTS[0],
             ",".join(self.cfg["symbols"]),
             ",".join(self.cfg["timeframes"]),
+            self.cfg.get("paper_active_timeframe") or paper_engine.DEFAULT_ACTIVE_TIMEFRAME,
             self.cfg["sensitivity"],
             "on" if self.alerter.enabled else "off",
         )
         self.refresh_universe()
         self.seed_all()
+        try:
+            self.migrate_paper_accounts()
+        except Exception as e:
+            log.error("paper migration failed: %s", e)
         # REST catch-up always runs, but only for markets whose last closed
         # bar is missing. Confirmed signals come from WS x=true when frames
         # arrive, otherwise from this catch-up within a few seconds of close.
@@ -1196,6 +1249,10 @@ async def amain(args: argparse.Namespace) -> int:
     if args.once:
         bot.refresh_universe()
         bot.seed_all()
+        try:
+            bot.migrate_paper_accounts()
+        except Exception as e:
+            log.error("paper migration failed: %s", e)
         return 0
 
     loop = asyncio.get_running_loop()
