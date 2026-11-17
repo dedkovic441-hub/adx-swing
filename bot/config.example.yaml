@@ -3,7 +3,7 @@
 #   export TELEGRAM_BOT_TOKEN="..."
 #   export TELEGRAM_CHAT_ID="..."
 
-# 20 mid-cap Binance USD-M USDT perpetuals (24h quote-volume ranks ~15–60,
+# 30 mid-cap Binance USD-M USDT perpetuals (24h quote-volume ranks ~15–60,
 # excluding BTC, ETH, top majors and stablecoins). Refresh as the book changes.
 symbols:
   - AKEUSDT
@@ -26,6 +26,16 @@ symbols:
   - ARIAUSDT
   - TAOUSDT
   - INITUSDT
+  - RAREUSDT
+  - LITUSDT
+  - SUIUSDT
+  - AIOTUSDT
+  - CROSSUSDT
+  - ICPUSDT
+  - KAVAUSDT
+  - JUPUSDT
+  - ZROUSDT
+  - PIEVERSEUSDT
 
 timeframes:
   - 5m

@@ -59,7 +59,9 @@ WS_PING_INTERVAL = None
 WS_PING_TIMEOUT = None
 WS_RECV_WATCHDOG_SEC = 45
 WS_STALE_RECONNECT_SEC = 45
-CATCHUP_WORKERS = 8
+# Sized so a 30-symbol × 2-timeframe catch-up (60 jobs) has the same
+# number of batches as the original 20 × 2 setup with 8 workers.
+CATCHUP_WORKERS = 12
 CATCHUP_TRIES = 4
 CATCHUP_AFTER_CLOSE_SEC = 0.8
 
@@ -418,6 +420,10 @@ def urllib_klines(symbol: str, tf: str, limit: int = 3, tries: int = CATCHUP_TRI
     """
     path = f"/klines?symbol={symbol}&interval={tf}&limit={limit}"
     bases = list(REST_BASES[:1]) + ["https://www.binance.com"]
+    # Spread first-try hosts so a 30-coin parallel catch-up does not stampede
+    # a single CloudFront POP (a common source of intermittent 403s on this box).
+    start = sum(ord(c) for c in f"{symbol}:{tf}") % len(bases)
+    bases = bases[start:] + bases[:start]
     last_err: Optional[Exception] = None
     for attempt in range(max(1, int(tries))):
         for base in bases:
