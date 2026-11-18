@@ -217,6 +217,7 @@ def load_config(path: Optional[Path]) -> dict:
         "telegram_chat": os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT") or "",
         "unconfirmed_dca_every_signal_timeframes": paper_engine.load_unconfirmed_dca_timeframes(path),
         "unconfirmed_max_add_positions": paper_engine.load_unconfirmed_max_add(path),
+        "unconfirmed_dca_signal_every": paper_engine.load_unconfirmed_dca_signal_every(path),
         "paper_active_timeframe": paper_engine.load_active_timeframe(path),
         "paper_take_profit_usd": paper_engine.load_take_profit_usd(path),
     })
@@ -1259,13 +1260,14 @@ class SignalBot:
 
     async def run(self) -> None:
         log.info(
-            "coin-chart signal bot starting  market=USD-M  rest=%s  ws=%s  symbols=%s  tfs=%s  paper_tf=%s  paper_tp=%s  sensitivity=%s  telegram=%s",
+            "coin-chart signal bot starting  market=USD-M  rest=%s  ws=%s  symbols=%s  tfs=%s  paper_tf=%s  paper_tp=%s  dca_every=%s  sensitivity=%s  telegram=%s",
             REST_BASES[0] + REST_PREFIX,
             WS_HOSTS[0],
             ",".join(self.cfg["symbols"]),
             ",".join(self.cfg["timeframes"]),
             self.cfg.get("paper_active_timeframe") or paper_engine.DEFAULT_ACTIVE_TIMEFRAME,
             self.cfg.get("paper_take_profit_usd", paper_engine.DEFAULT_TAKE_PROFIT_USD),
+            self.cfg.get("unconfirmed_dca_signal_every", paper_engine.DEFAULT_DCA_SIGNAL_EVERY),
             self.cfg["sensitivity"],
             "on" if self.alerter.enabled else "off",
         )

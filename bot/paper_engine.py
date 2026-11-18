@@ -22,9 +22,11 @@ the open position is kept and marked faded. A later same-direction
 unconfirmed signal on the active timeframe can add another leg sized to
 the first leg's notional (not a fixed account default), up to
 max_add_positions extra legs (default 4, so 5 legs total). On timeframes
-in dca_every_signal_timeframes (default 15m), every new same-direction
-unconfirmed signal adds a leg with no fade required. Other timeframes
-(default 5m) still need a fade before a same-direction add.
+in dca_every_signal_timeframes (default 15m), same-direction unconfirmed
+signals are counted while the position is open (the entry is not) and a
+leg is added on every dca_signal_every-th signal (default 3: the 3rd,
+6th, 9th, 12th), with no fade required. Other timeframes still need a
+fade before a same-direction add.
 
 Confirmed state/trades: paper_state.json / paper_trades.jsonl
 Unconfirmed: paper_state_unconfirmed.json / paper_trades_unconfirmed.jsonl
@@ -53,6 +55,7 @@ LEVERAGE = 1.0
 TAKER_FEE = 0.0005  # 0.05% per side
 DEFAULT_MAX_ADD_POSITIONS = 4
 DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES = ("15m",)
+DEFAULT_DCA_SIGNAL_EVERY = 3
 DEFAULT_ACTIVE_TIMEFRAME = "15m"
 DEFAULT_TAKE_PROFIT_USD = 2.0
 WIB = timezone(timedelta(hours=7))
@@ -177,6 +180,46 @@ def load_unconfirmed_dca_timeframes(config_path: Optional[Path] = None) -> list[
     except Exception:
         pass
     return list(DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES)
+
+
+def load_unconfirmed_dca_signal_every(config_path: Optional[Path] = None) -> int:
+    """Read unconfirmed.dca_signal_every from config.yaml; default 3.
+
+    0 disables interval DCA adds. 1 restores add-on-every-same-direction-signal.
+    """
+    try:
+        data, text, path = _load_unconfirmed_yaml(config_path)
+        if not path.exists():
+            return DEFAULT_DCA_SIGNAL_EVERY
+        raw_val = None
+        if isinstance(data, dict):
+            raw = data.get("unconfirmed")
+            if isinstance(raw, dict) and raw.get("dca_signal_every") is not None:
+                raw_val = raw.get("dca_signal_every")
+            elif data.get("unconfirmed_dca_signal_every") is not None:
+                raw_val = data.get("unconfirmed_dca_signal_every")
+            elif data.get("dca_signal_every") is not None:
+                raw_val = data.get("dca_signal_every")
+        if raw_val is not None:
+            return max(0, int(raw_val))
+        in_unconf = False
+        for line in text.splitlines():
+            raw = line.split("#", 1)[0]
+            stripped = raw.strip()
+            indent = len(raw) - len(raw.lstrip())
+            if stripped.startswith("unconfirmed_dca_signal_every:"):
+                return max(0, int(stripped.split(":", 1)[1].strip().strip("'\"")))
+            if stripped.rstrip(":") == "unconfirmed" or stripped.startswith("unconfirmed:"):
+                in_unconf = True
+                continue
+            if in_unconf:
+                if stripped and indent == 0:
+                    in_unconf = False
+                elif stripped.startswith("dca_signal_every:"):
+                    return max(0, int(stripped.split(":", 1)[1].strip().strip("'\"")))
+    except Exception:
+        pass
+    return DEFAULT_DCA_SIGNAL_EVERY
 
 
 def load_active_timeframe(config_path: Optional[Path] = None) -> str:
@@ -311,6 +354,7 @@ class PaperEngine:
         scale_in: bool = False,
         max_add_positions: int = DEFAULT_MAX_ADD_POSITIONS,
         dca_every_signal_timeframes: Optional[list[str]] = None,
+        dca_signal_every: Optional[int] = DEFAULT_DCA_SIGNAL_EVERY,
         active_timeframe: Optional[str] = DEFAULT_ACTIVE_TIMEFRAME,
         take_profit_usd: Optional[float] = DEFAULT_TAKE_PROFIT_USD,
     ):
@@ -322,6 +366,10 @@ class PaperEngine:
         self.max_add_positions = max(0, int(max_add_positions))
         tfs = DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES if dca_every_signal_timeframes is None else dca_every_signal_timeframes
         self.dca_every_signal_timeframes = {str(t).lower() for t in tfs}
+        try:
+            self.dca_signal_every = max(0, int(dca_signal_every if dca_signal_every is not None else DEFAULT_DCA_SIGNAL_EVERY))
+        except (TypeError, ValueError):
+            self.dca_signal_every = DEFAULT_DCA_SIGNAL_EVERY
         self.active_timeframe = str(active_timeframe).strip().lower() if active_timeframe else ""
         try:
             self.take_profit_usd = max(0.0, float(take_profit_usd if take_profit_usd is not None else DEFAULT_TAKE_PROFIT_USD))
@@ -378,6 +426,8 @@ class PaperEngine:
         st["updated_utc"] = _fmt_utc(now)
         st["updated_wib"] = _fmt_wib(now)
         st["take_profit_usd"] = self.take_profit_usd
+        if self.scale_in:
+            st["dca_signal_every"] = self.dca_signal_every
         tmp = self.state_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(st, indent=2), encoding="utf-8")
         tmp.replace(self.state_path)
@@ -550,6 +600,7 @@ class PaperEngine:
         pos["leg_count"] = len(pos["legs"])
         pos.setdefault("faded", False)
         pos.setdefault("fade_count", 0)
+        pos.setdefault("dca_signal_count", 0)
         return pos
 
     def _position_notional(self, st: dict) -> float:
@@ -592,6 +643,7 @@ class PaperEngine:
             pos["leg_count"] = 1
             pos["faded"] = False
             pos["fade_count"] = 0
+            pos["dca_signal_count"] = 0
             pos["legs"] = [{
                 "price": price,
                 "qty": qty,
@@ -987,6 +1039,30 @@ class PaperEngine:
         )
         return rec
 
+
+    def _on_same_direction_signal(self, st: dict, pos: dict, price: float, now: datetime) -> Optional[dict]:
+        """Count a same-direction signal and add a DCA leg when the rule says so.
+
+        On dca_every_signal_timeframes, the entry is not counted; each later
+        same-direction signal increments dca_signal_count, and a leg is added
+        when the count is a multiple of dca_signal_every (3rd, 6th, ...).
+        Other timeframes still require a fade before an add and do not use
+        the interval counter.
+        """
+        self._normalize_position(pos)
+        if self._requires_fade_to_add(pos.get("timeframe")):
+            return self._try_add_leg(st, pos, price, now, require_fade=True)
+        count = int(pos.get("dca_signal_count") or 0) + 1
+        pos["dca_signal_count"] = count
+        every = int(self.dca_signal_every)
+        if every > 0 and count % every == 0:
+            return self._try_add_leg(st, pos, price, now, require_fade=False)
+        log.info(
+            "paper DCA wait %s %s %s — same-dir signal %s (add every %s)",
+            pos.get("symbol"), pos.get("timeframe"), pos.get("side"), count, every,
+        )
+        return None
+
     def on_signal(self, symbol: str, tf: str, side_name: str, fill_price: float) -> None:
         """Apply a BUY/SELL (or BUY?/SELL?) at the given fill price.
 
@@ -1022,7 +1098,7 @@ class PaperEngine:
             _key, pos = self._find_position(st, symbol)
             if pos and pos.get("side") == want:
                 if self.scale_in:
-                    self._try_add_leg(st, pos, price, now)
+                    self._on_same_direction_signal(st, pos, price, now)
                     self.save(st)
                 else:
                     log.info("paper already %s %s — ignoring same-side signal", symbol, want)
@@ -1066,6 +1142,7 @@ def get_unconfirmed_engine() -> PaperEngine:
             scale_in=True,
             max_add_positions=load_unconfirmed_max_add(),
             dca_every_signal_timeframes=load_unconfirmed_dca_timeframes(),
+            dca_signal_every=load_unconfirmed_dca_signal_every(),
             active_timeframe=load_active_timeframe(),
             take_profit_usd=load_take_profit_usd(),
         )

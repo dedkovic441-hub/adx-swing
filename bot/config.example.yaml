@@ -68,12 +68,14 @@ paper:
   take_profit_usd: 2
 
 # Unconfirmed paper account: a faded BUY?/SELL? keeps the position open.
-# A later same-direction unconfirmed signal adds another leg sized to the
-# first leg's notional. max_add_positions is additional legs (4 → 5 total).
-# Timeframes in dca_every_signal_timeframes add a leg on every new
-# same-direction unconfirmed signal (including a pivot walk), with no fade
-# required. Other timeframes still need a fade first.
+# A later same-direction unconfirmed signal can add another leg sized to
+# the first leg's notional. max_add_positions is additional legs (4 → 5 total).
+# Timeframes in dca_every_signal_timeframes count same-direction unconfirmed
+# signals while the position is open (the entry is not counted) and add a
+# leg on every dca_signal_every-th signal (3rd, 6th, 9th, 12th), with no
+# fade required. Other timeframes still need a fade first.
 unconfirmed:
   max_add_positions: 4
+  dca_signal_every: 3
   dca_every_signal_timeframes:
     - 15m

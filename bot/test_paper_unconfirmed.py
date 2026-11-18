@@ -34,6 +34,7 @@ def _engine(tmp: Path, **kwargs) -> pe.PaperEngine:
         scale_in=True,
         max_add_positions=kwargs.get("max_add_positions", 4),
         dca_every_signal_timeframes=kwargs.get("dca_every_signal_timeframes", ["15m"]),
+        dca_signal_every=kwargs.get("dca_signal_every", 3),
         active_timeframe=kwargs.get("active_timeframe", None),
         take_profit_usd=kwargs.get("take_profit_usd", 2.0),
     )
@@ -118,17 +119,18 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         self.assertEqual([t["action"] for t in _trades(self.eng)], ["OPEN"])
 
     def test_cap_is_four_additional_legs(self):
-        self.eng.on_signal("CAPUSDT", "15m", "SELL?", 20.0)
+        # 5m is not in the default fade-free list, so each add still needs a fade.
+        self.eng.on_signal("CAPUSDT", "5m", "SELL?", 20.0)
         for px in (19.0, 18.0, 17.0, 16.0, 15.0):
-            self.eng.close_repainted("CAPUSDT", "15m", px + 0.1)
-            self.eng.on_signal("CAPUSDT", "15m", "SELL?", px)
+            self.eng.close_repainted("CAPUSDT", "5m", px + 0.1)
+            self.eng.on_signal("CAPUSDT", "5m", "SELL?", px)
         st = self.eng.load()
         pos = st["positions"]["CAPUSDT"]
         self.assertEqual(pos["leg_count"], 5)
         self.assertEqual(pos["notional"], 250.0)
         # Sixth same-direction after another fade is ignored
-        self.eng.close_repainted("CAPUSDT", "15m", 14.5)
-        self.eng.on_signal("CAPUSDT", "15m", "SELL?", 14.0)
+        self.eng.close_repainted("CAPUSDT", "5m", 14.5)
+        self.eng.on_signal("CAPUSDT", "5m", "SELL?", 14.0)
         st = self.eng.load()
         pos = st["positions"]["CAPUSDT"]
         self.assertEqual(pos["leg_count"], 5)
@@ -225,41 +227,66 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         self.assertEqual(st["closed_count"], 0)
         self.assertEqual([t["action"] for t in _trades(conf)], ["OPEN"])
 
-    def test_15m_dca_adds_without_fade(self):
+    def test_15m_dca_adds_on_every_third_same_dir_signal(self):
         self.eng.on_signal("DCAUSDT", "15m", "SELL?", 10.0)
-        self.eng.on_signal("DCAUSDT", "15m", "SELL?", 9.0)
+        self.eng.on_signal("DCAUSDT", "15m", "SELL?", 9.8)
+        pos = self.eng.load()["positions"]["DCAUSDT"]
+        self.assertEqual(pos["leg_count"], 1)
+        self.assertEqual(pos["dca_signal_count"], 1)
+        self.eng.on_signal("DCAUSDT", "15m", "SELL?", 9.6)
+        pos = self.eng.load()["positions"]["DCAUSDT"]
+        self.assertEqual(pos["leg_count"], 1)
+        self.assertEqual(pos["dca_signal_count"], 2)
+        self.eng.on_signal("DCAUSDT", "15m", "SELL?", 9.4)
         st = self.eng.load()
         pos = st["positions"]["DCAUSDT"]
         self.assertEqual(pos["leg_count"], 2)
+        self.assertEqual(pos["dca_signal_count"], 3)
         self.assertEqual(pos["notional"], 100.0)
         self.assertEqual(pos["first_notional"], 50.0)
         self.assertFalse(pos["faded"])
-        self.assertAlmostEqual(pos["qty"], 50.0 / 10.0 + 50.0 / 9.0)
+        self.assertAlmostEqual(pos["qty"], 50.0 / 10.0 + 50.0 / 9.4)
         add = [t for t in _trades(self.eng) if t["action"] == "ADD"][0]
         self.assertEqual(add["reason"], "dca")
         self.assertEqual(add["notional"], 50.0)
+        # 4th and 5th do not add; 6th does
+        self.eng.on_signal("DCAUSDT", "15m", "SELL?", 9.3)
+        self.eng.on_signal("DCAUSDT", "15m", "SELL?", 9.2)
+        self.assertEqual(self.eng.load()["positions"]["DCAUSDT"]["leg_count"], 2)
+        self.eng.on_signal("DCAUSDT", "15m", "SELL?", 9.1)
+        pos = self.eng.load()["positions"]["DCAUSDT"]
+        self.assertEqual(pos["leg_count"], 3)
+        self.assertEqual(pos["dca_signal_count"], 6)
 
     def test_15m_dca_uses_first_leg_notional(self):
         st = self.eng.load()
         st["notional"] = 30.0
         self.eng.save(st)
         self.eng.on_signal("DCA30USDT", "15m", "BUY?", 3.0)
+        self.eng.on_signal("DCA30USDT", "15m", "BUY?", 3.1)
+        self.eng.on_signal("DCA30USDT", "15m", "BUY?", 3.2)
         self.eng.on_signal("DCA30USDT", "15m", "BUY?", 4.0)
         pos = self.eng.load()["positions"]["DCA30USDT"]
         self.assertEqual(pos["first_notional"], 30.0)
         self.assertEqual(pos["notional"], 60.0)
         self.assertEqual(pos["leg_count"], 2)
+        self.assertEqual(pos["dca_signal_count"], 3)
 
     def test_15m_dca_respects_add_cap(self):
         self.eng.on_signal("CAP15USDT", "15m", "SELL?", 20.0)
-        for px in (19.0, 18.0, 17.0, 16.0, 15.0):
+        # 12 post-entry same-dir signals → adds on 3, 6, 9, 12 (max 4 adds)
+        for i, px in enumerate((19.5, 19.0, 18.5, 18.0, 17.5, 17.0, 16.5, 16.0, 15.5, 15.0, 14.5, 14.0), start=1):
             self.eng.on_signal("CAP15USDT", "15m", "SELL?", px)
         pos = self.eng.load()["positions"]["CAP15USDT"]
         self.assertEqual(pos["leg_count"], 5)
         self.assertEqual(pos["notional"], 250.0)
-        self.eng.on_signal("CAP15USDT", "15m", "SELL?", 14.0)
+        self.assertEqual(pos["dca_signal_count"], 12)
+        self.eng.on_signal("CAP15USDT", "15m", "SELL?", 13.5)
+        self.eng.on_signal("CAP15USDT", "15m", "SELL?", 13.0)
+        self.eng.on_signal("CAP15USDT", "15m", "SELL?", 12.5)  # would be 15th, still capped
         pos = self.eng.load()["positions"]["CAP15USDT"]
         self.assertEqual(pos["leg_count"], 5)
+        self.assertEqual(pos["dca_signal_count"], 15)
         adds = [t for t in _trades(self.eng) if t["action"] == "ADD"]
         self.assertEqual(len(adds), 4)
 
@@ -299,6 +326,75 @@ class UnconfirmedScaleInTests(unittest.TestCase):
         cfg.write_text("symbols: [AKEUSDT]\n", encoding="utf-8")
         self.assertEqual(pe.load_unconfirmed_dca_timeframes(cfg), ["15m"])
         self.assertEqual(pe.load_unconfirmed_dca_timeframes(self.tmp / "missing.yaml"), ["15m"])
+
+    def test_load_unconfirmed_dca_signal_every_from_yaml(self):
+        cfg = self.tmp / "config.yaml"
+        cfg.write_text("unconfirmed:\n  dca_signal_every: 3\n", encoding="utf-8")
+        self.assertEqual(pe.load_unconfirmed_dca_signal_every(cfg), 3)
+        cfg.write_text("unconfirmed:\n  dca_signal_every: 1\n", encoding="utf-8")
+        self.assertEqual(pe.load_unconfirmed_dca_signal_every(cfg), 1)
+        cfg.write_text("unconfirmed:\n  dca_signal_every: 0\n", encoding="utf-8")
+        self.assertEqual(pe.load_unconfirmed_dca_signal_every(cfg), 0)
+        cfg.write_text("symbols: [AKEUSDT]\n", encoding="utf-8")
+        self.assertEqual(pe.load_unconfirmed_dca_signal_every(cfg), 3)
+        self.assertEqual(pe.load_unconfirmed_dca_signal_every(self.tmp / "missing.yaml"), 3)
+
+    def test_5m_interval_dca_when_listed(self):
+        eng = _engine(self.tmp, dca_every_signal_timeframes=["15m", "5m"], dca_signal_every=3, active_timeframe="5m")
+        eng.on_signal("FIVDCAUSDT", "5m", "BUY?", 10.0)
+        eng.on_signal("FIVDCAUSDT", "5m", "BUY?", 10.1)
+        eng.on_signal("FIVDCAUSDT", "5m", "BUY?", 10.2)
+        self.assertEqual(eng.load()["positions"]["FIVDCAUSDT"]["leg_count"], 1)
+        eng.on_signal("FIVDCAUSDT", "5m", "BUY?", 10.3)
+        pos = eng.load()["positions"]["FIVDCAUSDT"]
+        self.assertEqual(pos["leg_count"], 2)
+        self.assertEqual(pos["dca_signal_count"], 3)
+        self.assertFalse(pos["faded"])
+
+    def test_dca_signal_count_persists_and_existing_starts_at_zero(self):
+        self.eng.on_signal("PERSUSDT", "15m", "BUY?", 10.0)
+        self.eng.on_signal("PERSUSDT", "15m", "BUY?", 10.1)
+        path = self.tmp / "paper_state_unconfirmed.json"
+        st = self.eng.load()
+        self.assertEqual(st["positions"]["PERSUSDT"]["dca_signal_count"], 1)
+        self.assertEqual(st["dca_signal_every"], 3)
+        # Reload a fresh engine against the same files (restart)
+        eng2 = _engine(self.tmp)
+        eng2.on_signal("PERSUSDT", "15m", "BUY?", 10.2)
+        self.assertEqual(eng2.load()["positions"]["PERSUSDT"]["dca_signal_count"], 2)
+        self.assertEqual(eng2.load()["positions"]["PERSUSDT"]["leg_count"], 1)
+        eng2.on_signal("PERSUSDT", "15m", "BUY?", 10.3)
+        self.assertEqual(eng2.load()["positions"]["PERSUSDT"]["leg_count"], 2)
+        # A position saved without a counter starts at 0
+        st = eng2.load()
+        raw = {
+            "symbol": "OLDCTAUSDT",
+            "timeframe": "15m",
+            "side": "LONG",
+            "qty": 5.0,
+            "entry": 10.0,
+            "notional": 50.0,
+            "margin": 50.0,
+            "entry_fee": 0.025,
+            "first_notional": 50.0,
+            "leg_count": 1,
+            "opened_at_utc": "2026-11-18T00:00:00Z",
+            "opened_at_wib": "2026-11-18 07:00:00 Asia/Jakarta",
+        }
+        st["positions"]["OLDCTAUSDT"] = raw
+        eng2.save(st)
+        eng2.on_signal("OLDCTAUSDT", "15m", "BUY?", 10.05)
+        pos = eng2.load()["positions"]["OLDCTAUSDT"]
+        self.assertEqual(pos["dca_signal_count"], 1)
+        self.assertEqual(pos["leg_count"], 1)
+
+    def test_dca_every_one_adds_on_each_signal(self):
+        eng = _engine(self.tmp, dca_signal_every=1, active_timeframe="15m")
+        eng.on_signal("EACHUSDT", "15m", "BUY?", 10.0)
+        eng.on_signal("EACHUSDT", "15m", "BUY?", 10.1)
+        pos = eng.load()["positions"]["EACHUSDT"]
+        self.assertEqual(pos["leg_count"], 2)
+        self.assertEqual(pos["dca_signal_count"], 1)
 
 
 class ActiveTimeframeAndOnePerCoinTests(unittest.TestCase):
@@ -503,7 +599,7 @@ class TakeProfitTests(unittest.TestCase):
         self.assertNotIn("TPSHORTUSDT", eng.load()["positions"])
 
     def test_tp_with_dca_legs_uses_avg_entry_and_total_qty(self):
-        eng = self._eng(active_timeframe="15m", dca_every_signal_timeframes=["15m"])
+        eng = self._eng(active_timeframe="15m", dca_every_signal_timeframes=["15m"], dca_signal_every=1)
         # Small same-side adds so the stack is not already past +$2 at the add price
         eng.on_signal("TPDCAUSDT", "15m", "BUY?", 10.0)
         eng.on_signal("TPDCAUSDT", "15m", "BUY?", 10.02)
