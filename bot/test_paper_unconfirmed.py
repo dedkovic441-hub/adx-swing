@@ -14,6 +14,18 @@ sys.path.insert(0, str(BOT_DIR))
 import paper_engine as pe  # noqa: E402
 
 
+_orig_default_state = pe.default_state
+
+
+def _fixed_default_state() -> dict:
+    st = _orig_default_state()
+    st["sizing"] = "fixed"  # legacy tests exercise fixed-notional sizing
+    return st
+
+
+pe.default_state = _fixed_default_state
+
+
 def _engine(tmp: Path, **kwargs) -> pe.PaperEngine:
     return pe.PaperEngine(
         state_path=tmp / "paper_state_unconfirmed.json",
@@ -405,6 +417,20 @@ class ActiveTimeframeAndOnePerCoinTests(unittest.TestCase):
         self.assertEqual(recs2, [])
         self.assertEqual(set(eng.load()["positions"]), {"FOOUSDT"})
 
+
+
+
+
+class CompoundingSizingTests(unittest.TestCase):
+    def test_compound_sizes_from_balance(self):
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        eng = _engine(tmp)
+        st = _orig_default_state()
+        st["balance"] = 1200.0
+        self.assertEqual(eng._position_notional(st), 60.0)
+        st["sizing"] = "fixed"
+        self.assertEqual(eng._position_notional(st), 50.0)
 
 
 if __name__ == "__main__":

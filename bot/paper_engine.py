@@ -46,6 +46,7 @@ LOCK_PATH = ROOT / "run" / "paper.lock"
 
 STARTING_BALANCE = 1000.0
 NOTIONAL = 50.0
+SIZE_PCT = 0.05  # compounding: each new position = 5% of current balance
 LEVERAGE = 1.0
 TAKER_FEE = 0.0005  # 0.05% per side
 DEFAULT_MAX_ADD_POSITIONS = 4
@@ -222,6 +223,8 @@ def default_state() -> dict:
         "realized_pnl": 0.0,
         "fees_paid": 0.0,
         "notional": NOTIONAL,
+        "sizing": "compound",
+        "size_pct": SIZE_PCT,
         "leverage": LEVERAGE,
         "taker_fee": TAKER_FEE,
         "positions": {},
@@ -476,8 +479,15 @@ class PaperEngine:
         pos.setdefault("fade_count", 0)
         return pos
 
+    def _position_notional(self, st: dict) -> float:
+        """Compounding: size_pct of current realized balance; else fixed notional."""
+        if str(st.get("sizing") or "").lower() == "compound":
+            pct = float(st.get("size_pct") or SIZE_PCT)
+            return max(0.0, float(st["balance"]) * pct)
+        return float(st.get("notional") or NOTIONAL)
+
     def _open(self, st: dict, symbol: str, tf: str, side: str, price: float, now: datetime, reason: str) -> Optional[dict]:
-        notional = float(st.get("notional") or NOTIONAL)
+        notional = self._position_notional(st)
         lev = float(st.get("leverage") or LEVERAGE) or 1.0
         fee_rate = float(st.get("taker_fee") or TAKER_FEE)
         margin = notional / lev
