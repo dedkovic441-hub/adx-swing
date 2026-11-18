@@ -410,6 +410,65 @@ def load_cooldown_minutes(config_path: Optional[Path] = None) -> float:
     return float(DEFAULT_COOLDOWN_MINUTES)
 
 
+def load_size_pct(config_path: Optional[Path] = None) -> float:
+    """Read paper.size_pct from config.yaml as a fraction; default 0.05 (5%).
+
+    Values > 1 are treated as a percent (5 -> 0.05). Clamped to (0, 1].
+    """
+    try:
+        data, text, path = _load_unconfirmed_yaml(config_path)
+        if not path.exists():
+            return float(SIZE_PCT)
+        raw_val = None
+        if isinstance(data, dict):
+            raw = data.get("paper")
+            if isinstance(raw, dict) and raw.get("size_pct") is not None:
+                raw_val = raw.get("size_pct")
+            elif data.get("paper_size_pct") is not None:
+                raw_val = data.get("paper_size_pct")
+            elif data.get("size_pct") is not None:
+                raw_val = data.get("size_pct")
+        if raw_val is None:
+            in_paper = False
+            for line in text.splitlines():
+                raw = line.split("#", 1)[0]
+                stripped = raw.strip()
+                indent = len(raw) - len(raw.lstrip())
+                if stripped.startswith("paper_size_pct:"):
+                    raw_val = stripped.split(":", 1)[1].strip().strip("'\"")
+                    break
+                if stripped.rstrip(":") == "paper" or stripped.startswith("paper:"):
+                    in_paper = True
+                    continue
+                if in_paper:
+                    if stripped and indent == 0:
+                        in_paper = False
+                    elif stripped.startswith("size_pct:"):
+                        raw_val = stripped.split(":", 1)[1].strip().strip("'\"")
+                        break
+        if raw_val is not None:
+            pct = float(raw_val)
+            if pct > 1.0:
+                pct = pct / 100.0
+            if pct <= 0:
+                return float(SIZE_PCT)
+            return min(1.0, pct)
+    except Exception:
+        pass
+    return float(SIZE_PCT)
+
+
+def size_pct_to_percent(size_pct: float) -> float:
+    """Convert a fraction such as 0.05 to a 5.0 percent figure."""
+    try:
+        pct = float(size_pct)
+    except (TypeError, ValueError):
+        pct = float(SIZE_PCT)
+    if pct > 1.0:
+        return pct
+    return pct * 100.0
+
+
 def default_state() -> dict:
     return {
         "starting_balance": STARTING_BALANCE,
@@ -445,6 +504,7 @@ class PaperEngine:
         leverage: Optional[float] = DEFAULT_LEVERAGE,
         cooldown_minutes: Optional[float] = DEFAULT_COOLDOWN_MINUTES,
         maintenance_margin_rate: Optional[float] = DEFAULT_MAINTENANCE_MARGIN_RATE,
+        size_pct: Optional[float] = None,
     ):
         self.state_path = state_path
         self.trades_path = trades_path
@@ -475,6 +535,14 @@ class PaperEngine:
             self.maintenance_margin_rate = max(0.0, float(maintenance_margin_rate if maintenance_margin_rate is not None else DEFAULT_MAINTENANCE_MARGIN_RATE))
         except (TypeError, ValueError):
             self.maintenance_margin_rate = DEFAULT_MAINTENANCE_MARGIN_RATE
+        try:
+            raw_pct = SIZE_PCT if size_pct is None else size_pct
+            pct = float(raw_pct)
+            if pct > 1.0:
+                pct = pct / 100.0
+            self.size_pct = pct if pct > 0 else float(SIZE_PCT)
+        except (TypeError, ValueError):
+            self.size_pct = float(SIZE_PCT)
         self._clock_now: Optional[datetime] = None
 
     def _clock(self) -> datetime:
@@ -537,6 +605,7 @@ class PaperEngine:
         st["take_profit_usd"] = self.take_profit_usd
         st["leverage"] = self.leverage
         st["cooldown_minutes"] = self.cooldown_minutes
+        st["size_pct"] = self.size_pct
         if self.scale_in:
             st["dca_signal_every"] = self.dca_signal_every
         tmp = self.state_path.with_suffix(".json.tmp")
@@ -734,7 +803,12 @@ class PaperEngine:
         In fixed sizing the historical `notional` field is the 1x size, i.e. the margin.
         """
         if str(st.get("sizing") or "").lower() == "compound":
-            pct = float(st.get("size_pct") or SIZE_PCT)
+            if getattr(self, "size_pct", None) is not None:
+                pct = float(self.size_pct)
+            else:
+                pct = float(st.get("size_pct") or SIZE_PCT)
+            if pct > 1.0:
+                pct = pct / 100.0
             return max(0.0, float(st["balance"]) * pct)
         return float(st.get("notional") or NOTIONAL)
 
@@ -1379,6 +1453,7 @@ def get_engine() -> PaperEngine:
             take_profit_usd=load_take_profit_usd(),
             leverage=load_leverage(),
             cooldown_minutes=load_cooldown_minutes(),
+            size_pct=load_size_pct(),
         )
     return _ENGINE
 
@@ -1398,6 +1473,7 @@ def get_unconfirmed_engine() -> PaperEngine:
             take_profit_usd=load_take_profit_usd(),
             leverage=load_leverage(),
             cooldown_minutes=load_cooldown_minutes(),
+            size_pct=load_size_pct(),
         )
     return _UNCONF_ENGINE
 

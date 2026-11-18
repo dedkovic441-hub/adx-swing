@@ -29,3 +29,4 @@ run/*.pid
 run/*.lock
 run/*.tmp
 run/watchlist.txt
+run/settings_applied.json

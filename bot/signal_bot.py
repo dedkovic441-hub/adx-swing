@@ -59,8 +59,8 @@ WS_PING_INTERVAL = None
 WS_PING_TIMEOUT = None
 WS_RECV_WATCHDOG_SEC = 45
 WS_STALE_RECONNECT_SEC = 45
-# Sized so a 30-symbol × 2-timeframe catch-up (60 jobs) has the same
-# number of batches as the original 20 × 2 setup with 8 workers.
+# Sized so a 30-symbol × 3-timeframe catch-up (90 jobs) stays in a
+# similar number of batches to the original 20 × 2 setup with 8 workers.
 CATCHUP_WORKERS = 12
 CATCHUP_TRIES = 4
 CATCHUP_AFTER_CLOSE_SEC = 0.8
@@ -171,7 +171,7 @@ def format_alert(symbol: str, tf: str, sig: dict, chart: str) -> str:
 
 DEFAULTS = {
     "symbols": ["PUMPUSDT", "BTCUSDT", "ETHUSDT"],
-    "timeframes": ["5m", "15m"],
+    "timeframes": ["1m", "5m", "15m"],
     "sensitivity": "medium",
     "provisional_alerts": False,
     "top_n_by_volume": 0,
@@ -222,6 +222,7 @@ def load_config(path: Optional[Path]) -> dict:
         "paper_take_profit_usd": paper_engine.load_take_profit_usd(path),
         "paper_leverage": paper_engine.load_leverage(path),
         "paper_cooldown_minutes": paper_engine.load_cooldown_minutes(path),
+        "paper_size_pct": paper_engine.load_size_pct(path),
     })
     return cfg
 
@@ -1070,7 +1071,8 @@ class SignalBot:
 
     async def connect_ws_loop(self) -> None:
         # Wait until markets exist, then run one self-healing socket per
-        # timeframe so a stall on 5m does not drop 15m (and vice versa).
+        # timeframe (1m / 5m / 15m, 30 streams each) so a stall on one TF
+        # does not drop the others.
         while not self.stop.is_set() and not self.watch_pairs():
             await asyncio.sleep(1)
         if self.stop.is_set():
@@ -1262,7 +1264,7 @@ class SignalBot:
 
     async def run(self) -> None:
         log.info(
-            "coin-chart signal bot starting  market=USD-M  rest=%s  ws=%s  symbols=%s  tfs=%s  paper_tf=%s  paper_tp=%s  paper_lev=%s  cooldown=%sm  dca_every=%s  sensitivity=%s  telegram=%s",
+            "coin-chart signal bot starting  market=USD-M  rest=%s  ws=%s  symbols=%s  tfs=%s  paper_tf=%s  paper_tp=%s  paper_lev=%s  size=%s%%  cooldown=%sm  dca_every=%s  sensitivity=%s  telegram=%s",
             REST_BASES[0] + REST_PREFIX,
             WS_HOSTS[0],
             ",".join(self.cfg["symbols"]),
@@ -1270,6 +1272,7 @@ class SignalBot:
             self.cfg.get("paper_active_timeframe") or paper_engine.DEFAULT_ACTIVE_TIMEFRAME,
             self.cfg.get("paper_take_profit_usd", paper_engine.DEFAULT_TAKE_PROFIT_USD),
             self.cfg.get("paper_leverage", paper_engine.DEFAULT_LEVERAGE),
+            paper_engine.size_pct_to_percent(self.cfg.get("paper_size_pct", paper_engine.SIZE_PCT)),
             self.cfg.get("paper_cooldown_minutes", paper_engine.DEFAULT_COOLDOWN_MINUTES),
             self.cfg.get("unconfirmed_dca_signal_every", paper_engine.DEFAULT_DCA_SIGNAL_EVERY),
             self.cfg["sensitivity"],

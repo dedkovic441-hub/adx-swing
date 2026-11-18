@@ -38,6 +38,7 @@ symbols:
   - PIEVERSEUSDT
 
 timeframes:
+  - 1m
   - 5m
   - 15m
 
@@ -57,8 +58,9 @@ chart_url: https://dedkovic441-hub.github.io/zigzag-swing/
 # REST polling interval (also used as a backup while the WebSocket is live)
 poll_interval_sec: 15
 
-# Paper accounts trade only this timeframe, with one open position per coin.
-# Signals on other timeframes are still alerted and logged, but do not trade.
+# Scanner timeframes (1m/5m/15m). Paper accounts trade only paper.active_timeframe,
+# with one open position per coin. Switching it closes other-timeframe positions
+# (reason: timeframe_off). Signals on other timeframes are still alerted and logged.
 # Compounding: margin per new position is 5% of realized balance, notional is
 # margin x leverage. An open trade closes at +take_profit_usd net (after 0.05%
 # taker fees on both sides), on an opposite-direction signal, or on isolated
@@ -70,6 +72,7 @@ paper:
   take_profit_usd: 2
   leverage: 3
   cooldown_minutes: 3
+  size_pct: 0.05
 
 # Unconfirmed paper account: a faded BUY?/SELL? keeps the position open.
 # A later same-direction unconfirmed signal can add another leg sized to
@@ -82,4 +85,6 @@ unconfirmed:
   max_add_positions: 4
   dca_signal_every: 3
   dca_every_signal_timeframes:
+    - 1m
+    - 5m
     - 15m
