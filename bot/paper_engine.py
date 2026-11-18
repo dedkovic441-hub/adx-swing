@@ -9,11 +9,13 @@ Each account holds at most one open position per coin, and only signals
 on paper.active_timeframe (default 15m) are traded. Signals on other
 timeframes are still alerted and logged, but do not open, add, or close.
 
-A LONG is closed only by a SHORT signal, which realizes PnL and flips
-into a new short. A SHORT is closed only by a LONG signal, which flips
-into a new long. Fade, timeout, stop, and take-profit never close a
-position. The one exception is a one-time migration that closes leftover
-positions on a non-active timeframe (reason "timeframe_off").
+A LONG is closed by a SHORT signal (which realizes PnL and flips into a
+new short) or by a take-profit of paper.take_profit_usd net dollars
+(default +$2 after entry and exit taker fees), whichever happens first.
+A SHORT is closed by a LONG signal (flip) or the same take-profit.
+A take-profit just closes the position; it does not flip. Fade, timeout,
+and stop never close a position. A one-time migration may also close
+leftover positions on a non-active timeframe (reason "timeframe_off").
 
 Unconfirmed scale-in: if that forming pivot disappears (fades/repaints),
 the open position is kept and marked faded. A later same-direction
@@ -52,6 +54,7 @@ TAKER_FEE = 0.0005  # 0.05% per side
 DEFAULT_MAX_ADD_POSITIONS = 4
 DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES = ("15m",)
 DEFAULT_ACTIVE_TIMEFRAME = "15m"
+DEFAULT_TAKE_PROFIT_USD = 2.0
 WIB = timezone(timedelta(hours=7))
 
 
@@ -216,6 +219,69 @@ def load_active_timeframe(config_path: Optional[Path] = None) -> str:
     return DEFAULT_ACTIVE_TIMEFRAME
 
 
+
+def _parse_utc(val) -> Optional[datetime]:
+    """Parse an ISO UTC stamp or epoch seconds into an aware datetime."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(val), tz=timezone.utc)
+        except (OSError, ValueError, OverflowError):
+            return None
+    s = str(val).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def load_take_profit_usd(config_path: Optional[Path] = None) -> float:
+    """Read paper.take_profit_usd from config.yaml; default 2.0. 0 disables TP."""
+    try:
+        data, text, path = _load_unconfirmed_yaml(config_path)
+        if not path.exists():
+            return DEFAULT_TAKE_PROFIT_USD
+        raw_val = None
+        if isinstance(data, dict):
+            raw = data.get("paper")
+            if isinstance(raw, dict) and raw.get("take_profit_usd") is not None:
+                raw_val = raw.get("take_profit_usd")
+            elif data.get("take_profit_usd") is not None:
+                raw_val = data.get("take_profit_usd")
+            elif data.get("paper_take_profit_usd") is not None:
+                raw_val = data.get("paper_take_profit_usd")
+        if raw_val is not None:
+            return max(0.0, float(raw_val))
+        in_paper = False
+        for line in text.splitlines():
+            raw = line.split("#", 1)[0]
+            stripped = raw.strip()
+            indent = len(raw) - len(raw.lstrip())
+            if stripped.startswith("paper_take_profit_usd:") or (
+                stripped.startswith("take_profit_usd:") and not in_paper and indent == 0
+            ):
+                return max(0.0, float(stripped.split(":", 1)[1].strip().strip("'\"")))
+            if stripped.rstrip(":") == "paper" or stripped.startswith("paper:"):
+                in_paper = True
+                continue
+            if in_paper:
+                if stripped and indent == 0:
+                    in_paper = False
+                elif stripped.startswith("take_profit_usd:"):
+                    return max(0.0, float(stripped.split(":", 1)[1].strip().strip("'\"")))
+    except Exception:
+        pass
+    return DEFAULT_TAKE_PROFIT_USD
+
+
 def default_state() -> dict:
     return {
         "starting_balance": STARTING_BALANCE,
@@ -227,6 +293,7 @@ def default_state() -> dict:
         "size_pct": SIZE_PCT,
         "leverage": LEVERAGE,
         "taker_fee": TAKER_FEE,
+        "take_profit_usd": DEFAULT_TAKE_PROFIT_USD,
         "positions": {},
         "closed_count": 0,
         "win_count": 0,
@@ -245,6 +312,7 @@ class PaperEngine:
         max_add_positions: int = DEFAULT_MAX_ADD_POSITIONS,
         dca_every_signal_timeframes: Optional[list[str]] = None,
         active_timeframe: Optional[str] = DEFAULT_ACTIVE_TIMEFRAME,
+        take_profit_usd: Optional[float] = DEFAULT_TAKE_PROFIT_USD,
     ):
         self.state_path = state_path
         self.trades_path = trades_path
@@ -255,6 +323,10 @@ class PaperEngine:
         tfs = DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES if dca_every_signal_timeframes is None else dca_every_signal_timeframes
         self.dca_every_signal_timeframes = {str(t).lower() for t in tfs}
         self.active_timeframe = str(active_timeframe).strip().lower() if active_timeframe else ""
+        try:
+            self.take_profit_usd = max(0.0, float(take_profit_usd if take_profit_usd is not None else DEFAULT_TAKE_PROFIT_USD))
+        except (TypeError, ValueError):
+            self.take_profit_usd = DEFAULT_TAKE_PROFIT_USD
 
     def _lock_file(self):
         fh = open(self.lock_path, "a+")
@@ -305,6 +377,7 @@ class PaperEngine:
         now = _now_utc()
         st["updated_utc"] = _fmt_utc(now)
         st["updated_wib"] = _fmt_wib(now)
+        st["take_profit_usd"] = self.take_profit_usd
         tmp = self.state_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(st, indent=2), encoding="utf-8")
         tmp.replace(self.state_path)
@@ -688,13 +761,166 @@ class PaperEngine:
             rec["total_notional"] = float(pos.get("notional") or 0)
         self._append_trade(rec)
         log.info(
-            "paper CLOSE %s %s %s entry=%s exit=%s pnl=%.5f",
-            pos["symbol"], pos["timeframe"], side, entry, price, pnl,
+            "paper CLOSE %s %s %s entry=%s exit=%s pnl=%.5f reason=%s",
+            pos["symbol"], pos["timeframe"], side, entry, price, pnl, reason,
         )
         return rec
 
+
+    def _fee_rate(self, st: dict) -> float:
+        return float(st.get("taker_fee") or TAKER_FEE)
+
+    def _unrealized_pnl(self, st: dict, pos: dict, price: float) -> float:
+        """Net PnL at `price` after entry and exit taker fees (same formula as _close)."""
+        qty = float(pos["qty"])
+        entry = float(pos["entry"])
+        fee_rate = self._fee_rate(st)
+        exit_fee = qty * price * fee_rate
+        direction = 1.0 if pos.get("side") == "LONG" else -1.0
+        gross = (price - entry) * qty * direction
+        return gross - float(pos.get("entry_fee") or 0) - exit_fee
+
+    def _take_profit_price(self, st: dict, pos: dict) -> Optional[float]:
+        """Exit price at which net PnL equals take_profit_usd. None if TP is disabled."""
+        target = float(self.take_profit_usd)
+        if target <= 0:
+            return None
+        qty = float(pos.get("qty") or 0)
+        entry = float(pos.get("entry") or 0)
+        if qty <= 0 or entry <= 0:
+            return None
+        fee_rate = self._fee_rate(st)
+        entry_fee = float(pos.get("entry_fee") or 0)
+        side = pos.get("side")
+        if side == "LONG":
+            denom = qty * (1.0 - fee_rate)
+            if denom <= 0:
+                return None
+            px = (target + entry_fee + entry * qty) / denom
+            return px if px > 0 else None
+        if side == "SHORT":
+            denom = qty * (1.0 + fee_rate)
+            if denom <= 0:
+                return None
+            px = (entry * qty - entry_fee - target) / denom
+            return px if px > 0 else None
+        return None
+
+    def _last_fill_ts(self, pos: dict) -> Optional[float]:
+        """Epoch seconds of the most recent fill (open or last DCA add)."""
+        stamps: list[float] = []
+        for raw in (pos.get("last_add_utc"), pos.get("opened_at_utc")):
+            dt = _parse_utc(raw)
+            if dt is not None:
+                stamps.append(dt.timestamp())
+        for leg in (pos.get("legs") or []):
+            if not isinstance(leg, dict):
+                continue
+            dt = _parse_utc(leg.get("opened_at_utc"))
+            if dt is not None:
+                stamps.append(dt.timestamp())
+        return max(stamps) if stamps else None
+
+    def _bar_allows_wicks(self, pos: dict, bar_open_ts: Optional[float]) -> bool:
+        """True when the whole candle is at or after the last fill, so high/low are safe."""
+        if bar_open_ts is None:
+            return False
+        fill_ts = self._last_fill_ts(pos)
+        if fill_ts is None:
+            return False
+        return float(bar_open_ts) >= fill_ts - 1e-9
+
+    def _tp_hit(
+        self,
+        pos: dict,
+        tp_price: float,
+        high: Optional[float],
+        low: Optional[float],
+        last: Optional[float],
+        bar_open_ts: Optional[float],
+    ) -> bool:
+        side = pos.get("side")
+        use_wicks = self._bar_allows_wicks(pos, bar_open_ts)
+        if side == "LONG":
+            if use_wicks and high is not None and float(high) >= tp_price:
+                return True
+            if last is not None and float(last) >= tp_price:
+                return True
+        elif side == "SHORT":
+            if use_wicks and low is not None and float(low) <= tp_price:
+                return True
+            if last is not None and float(last) <= tp_price:
+                return True
+        return False
+
+    def on_price(
+        self,
+        symbol: str,
+        high: Optional[float] = None,
+        low: Optional[float] = None,
+        last: Optional[float] = None,
+        bar_open_ts: Optional[float] = None,
+    ) -> list[dict]:
+        """Close the coin's open position at exact TP if this update hits +take_profit_usd net.
+
+        When the candle opened at or after the last fill, the bar high (longs) or
+        low (shorts) can trigger. Otherwise only `last` (live close / mark) is used,
+        so a pre-entry wick cannot stop the trade out. Fill is always the exact
+        price that yields +take_profit_usd net. No new position is opened.
+        """
+        if self.take_profit_usd <= 0:
+            return []
+        lock = self._lock_file()
+        try:
+            st = self.load()
+            st.setdefault("positions", {})
+            _key, pos = self._find_position(st, symbol)
+            if not pos:
+                return []
+            tp_price = self._take_profit_price(st, pos)
+            if tp_price is None:
+                return []
+            if not self._tp_hit(pos, tp_price, high, low, last, bar_open_ts):
+                return []
+            rec = self._close(st, pos, tp_price, _now_utc(), reason="take_profit")
+            self.save(st)
+            return [rec]
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+
+    def check_take_profits(self, prices: dict[str, float]) -> list[dict]:
+        """Close every open position whose mark/last has reached the net TP. Fill at exact TP."""
+        if self.take_profit_usd <= 0 or not prices:
+            return []
+        lock = self._lock_file()
+        closed_recs: list[dict] = []
+        try:
+            st = self.load()
+            st.setdefault("positions", {})
+            now = _now_utc()
+            for _key, pos in list((st.get("positions") or {}).items()):
+                if not isinstance(pos, dict):
+                    continue
+                symbol = pos.get("symbol") or str(_key).split(":")[0]
+                last = self._mark_price(prices, symbol)
+                if last is None:
+                    continue
+                tp_price = self._take_profit_price(st, pos)
+                if tp_price is None:
+                    continue
+                if not self._tp_hit(pos, tp_price, high=None, low=None, last=last, bar_open_ts=None):
+                    continue
+                closed_recs.append(self._close(st, pos, tp_price, now, reason="take_profit"))
+            if closed_recs:
+                self.save(st)
+            return closed_recs
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+
     def close_repainted(self, symbol: str, tf: str, fill_price: float) -> None:
-        """Mark an unconfirmed fade. Never close: only an opposite signal exits."""
+        """Mark an unconfirmed fade. Fade never exits; only an opposite signal or TP does."""
         try:
             price = float(fill_price)
         except (TypeError, ValueError):
@@ -823,7 +1049,10 @@ _UNCONF_ENGINE: Optional[PaperEngine] = None
 def get_engine() -> PaperEngine:
     global _ENGINE
     if _ENGINE is None:
-        _ENGINE = PaperEngine(active_timeframe=load_active_timeframe())
+        _ENGINE = PaperEngine(
+            active_timeframe=load_active_timeframe(),
+            take_profit_usd=load_take_profit_usd(),
+        )
     return _ENGINE
 
 
@@ -838,6 +1067,7 @@ def get_unconfirmed_engine() -> PaperEngine:
             max_add_positions=load_unconfirmed_max_add(),
             dca_every_signal_timeframes=load_unconfirmed_dca_timeframes(),
             active_timeframe=load_active_timeframe(),
+            take_profit_usd=load_take_profit_usd(),
         )
     return _UNCONF_ENGINE
 
@@ -852,3 +1082,23 @@ def on_unconfirmed_signal(symbol: str, tf: str, side_name: str, fill_price: floa
 
 def close_unconfirmed_repainted(symbol: str, tf: str, fill_price: float) -> None:
     get_unconfirmed_engine().close_repainted(symbol, tf, fill_price)
+
+
+def check_price(
+    symbol: str,
+    high: Optional[float] = None,
+    low: Optional[float] = None,
+    last: Optional[float] = None,
+    bar_open_ts: Optional[float] = None,
+) -> list[dict]:
+    recs: list[dict] = []
+    recs.extend(get_engine().on_price(symbol, high=high, low=low, last=last, bar_open_ts=bar_open_ts))
+    recs.extend(get_unconfirmed_engine().on_price(symbol, high=high, low=low, last=last, bar_open_ts=bar_open_ts))
+    return recs
+
+
+def check_all_take_profits(prices: dict[str, float]) -> list[dict]:
+    recs: list[dict] = []
+    recs.extend(get_engine().check_take_profits(prices))
+    recs.extend(get_unconfirmed_engine().check_take_profits(prices))
+    return recs

@@ -35,6 +35,7 @@ def _engine(tmp: Path, **kwargs) -> pe.PaperEngine:
         max_add_positions=kwargs.get("max_add_positions", 4),
         dca_every_signal_timeframes=kwargs.get("dca_every_signal_timeframes", ["15m"]),
         active_timeframe=kwargs.get("active_timeframe", None),
+        take_profit_usd=kwargs.get("take_profit_usd", 2.0),
     )
 
 
@@ -431,6 +432,179 @@ class CompoundingSizingTests(unittest.TestCase):
         self.assertEqual(eng._position_notional(st), 60.0)
         st["sizing"] = "fixed"
         self.assertEqual(eng._position_notional(st), 50.0)
+
+
+
+
+class TakeProfitTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _eng(self, **kwargs):
+        return _engine(self.tmp, take_profit_usd=kwargs.pop("take_profit_usd", 2.0), **kwargs)
+
+    def test_load_take_profit_usd_from_yaml(self):
+        cfg = self.tmp / "config.yaml"
+        cfg.write_text("paper:\n  take_profit_usd: 3.5\n", encoding="utf-8")
+        self.assertEqual(pe.load_take_profit_usd(cfg), 3.5)
+        cfg.write_text("take_profit_usd: 1\n", encoding="utf-8")
+        self.assertEqual(pe.load_take_profit_usd(cfg), 1.0)
+        cfg.write_text("paper:\n  take_profit_usd: 0\n", encoding="utf-8")
+        self.assertEqual(pe.load_take_profit_usd(cfg), 0.0)
+        cfg.write_text("symbols: [AKEUSDT]\n", encoding="utf-8")
+        self.assertEqual(pe.load_take_profit_usd(cfg), 2.0)
+        self.assertEqual(pe.load_take_profit_usd(self.tmp / "missing.yaml"), 2.0)
+
+    def test_tp_closes_long_at_exact_price_no_flip(self):
+        eng = self._eng(active_timeframe="5m")
+        eng.on_signal("TPLONGUSDT", "5m", "BUY?", 10.0)
+        st = eng.load()
+        pos = st["positions"]["TPLONGUSDT"]
+        tp = eng._take_profit_price(st, pos)
+        self.assertIsNotNone(tp)
+        self.assertAlmostEqual(eng._unrealized_pnl(st, pos, tp), 2.0, places=9)
+        # Live last still below TP: stays open
+        recs = eng.on_price("TPLONGUSDT", last=10.2, high=10.2, low=9.9, bar_open_ts=2_000_000_000)
+        self.assertEqual(recs, [])
+        self.assertIn("TPLONGUSDT", eng.load()["positions"])
+        # Last reaches TP: close at exact TP, no new position
+        recs = eng.on_price("TPLONGUSDT", last=tp + 0.05, high=tp + 0.05, low=10.0, bar_open_ts=2_000_000_000)
+        self.assertEqual(len(recs), 1)
+        rec = recs[0]
+        self.assertEqual(rec["reason"], "take_profit")
+        self.assertAlmostEqual(rec["exit"], tp)
+        self.assertAlmostEqual(rec["pnl"], 2.0, places=9)
+        st = eng.load()
+        self.assertNotIn("TPLONGUSDT", st["positions"])
+        self.assertEqual(st["closed_count"], 1)
+        self.assertEqual(st["win_count"], 1)
+        self.assertEqual(st["take_profit_usd"], 2.0)
+        closes = [t for t in _trades(eng) if t["action"] == "CLOSE"]
+        self.assertEqual(len(closes), 1)
+        self.assertEqual(closes[0]["reason"], "take_profit")
+
+    def test_tp_closes_short_at_exact_price_no_flip(self):
+        eng = self._eng(active_timeframe="5m")
+        eng.on_signal("TPSHORTUSDT", "5m", "SELL?", 10.0)
+        st = eng.load()
+        pos = st["positions"]["TPSHORTUSDT"]
+        tp = eng._take_profit_price(st, pos)
+        self.assertLess(tp, 10.0)
+        self.assertAlmostEqual(eng._unrealized_pnl(st, pos, tp), 2.0, places=9)
+        recs = eng.on_price("TPSHORTUSDT", last=tp, low=tp, high=10.0, bar_open_ts=2_000_000_000)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["reason"], "take_profit")
+        self.assertAlmostEqual(recs[0]["exit"], tp)
+        self.assertAlmostEqual(recs[0]["pnl"], 2.0, places=9)
+        self.assertNotIn("TPSHORTUSDT", eng.load()["positions"])
+
+    def test_tp_with_dca_legs_uses_avg_entry_and_total_qty(self):
+        eng = self._eng(active_timeframe="15m", dca_every_signal_timeframes=["15m"])
+        # Small same-side adds so the stack is not already past +$2 at the add price
+        eng.on_signal("TPDCAUSDT", "15m", "BUY?", 10.0)
+        eng.on_signal("TPDCAUSDT", "15m", "BUY?", 10.02)
+        st = eng.load()
+        pos = st["positions"]["TPDCAUSDT"]
+        self.assertEqual(pos["leg_count"], 2)
+        qty = float(pos["qty"])
+        entry = float(pos["entry"])
+        entry_fee = float(pos["entry_fee"])
+        self.assertAlmostEqual(qty, 50.0 / 10.0 + 50.0 / 10.02)
+        tp = eng._take_profit_price(st, pos)
+        self.assertAlmostEqual(eng._unrealized_pnl(st, pos, tp), 2.0, places=9)
+        # Formula must use the blended entry and total qty
+        fee_rate = 0.0005
+        expected = (2.0 + entry_fee + entry * qty) / (qty * (1.0 - fee_rate))
+        self.assertAlmostEqual(tp, expected)
+        recs = eng.check_take_profits({"TPDCAUSDT": tp})
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["reason"], "take_profit")
+        self.assertEqual(recs[0]["leg_count"], 2)
+        self.assertAlmostEqual(recs[0]["pnl"], 2.0, places=9)
+        self.assertAlmostEqual(recs[0]["exit"], tp)
+        self.assertNotIn("TPDCAUSDT", eng.load()["positions"])
+
+    def test_opposite_signal_still_flips_when_tp_not_hit(self):
+        eng = self._eng(active_timeframe="5m")
+        eng.on_signal("FLIPUSDT", "5m", "BUY?", 10.0)
+        # 0.5% up is well under the ~4% needed for +$2 on a $50 long
+        recs = eng.on_price("FLIPUSDT", last=10.05, high=10.05, low=9.99, bar_open_ts=2_000_000_000)
+        self.assertEqual(recs, [])
+        self.assertIn("FLIPUSDT", eng.load()["positions"])
+        self.assertEqual(eng.load()["positions"]["FLIPUSDT"]["side"], "LONG")
+        eng.on_signal("FLIPUSDT", "5m", "SELL?", 10.05)
+        st = eng.load()
+        close = [t for t in _trades(eng) if t["action"] == "CLOSE"][0]
+        self.assertEqual(close["reason"], "opposite_signal")
+        pos = st["positions"]["FLIPUSDT"]
+        self.assertEqual(pos["side"], "SHORT")
+        self.assertEqual(pos["entry"], 10.05)
+        self.assertEqual(pos["leg_count"], 1)
+        self.assertEqual(st["closed_count"], 1)
+
+    def test_tp_uses_post_entry_wick_but_ignores_pre_entry_high(self):
+        eng = self._eng(active_timeframe="5m")
+        eng.on_signal("WICKUSDT", "5m", "BUY?", 10.0)
+        st = eng.load()
+        pos = st["positions"]["WICKUSDT"]
+        opened = pe._parse_utc(pos["opened_at_utc"]).timestamp()
+        tp = eng._take_profit_price(st, pos)
+        # Same bar as the fill (open before the last fill): a pre-entry high must not TP
+        recs = eng.on_price(
+            "WICKUSDT", high=tp + 1, low=9.9, last=10.01, bar_open_ts=opened - 60,
+        )
+        self.assertEqual(recs, [])
+        self.assertIn("WICKUSDT", eng.load()["positions"])
+        # A later bar: the high reaching TP fills at the exact TP price, even if close is below
+        recs = eng.on_price(
+            "WICKUSDT", high=tp + 0.2, low=10.0, last=10.05, bar_open_ts=opened + 300,
+        )
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["reason"], "take_profit")
+        self.assertAlmostEqual(recs[0]["exit"], tp)
+        self.assertAlmostEqual(recs[0]["pnl"], 2.0, places=9)
+        self.assertNotIn("WICKUSDT", eng.load()["positions"])
+
+    def test_tp_disabled_when_zero(self):
+        eng = self._eng(active_timeframe="5m", take_profit_usd=0)
+        eng.on_signal("OFFUSDT", "5m", "BUY?", 10.0)
+        recs = eng.on_price("OFFUSDT", last=20.0, high=20.0, low=10.0, bar_open_ts=2_000_000_000)
+        self.assertEqual(recs, [])
+        self.assertIn("OFFUSDT", eng.load()["positions"])
+        self.assertEqual(eng.check_take_profits({"OFFUSDT": 20.0}), [])
+
+    def test_existing_open_position_is_closed_by_mark_sweep(self):
+        # Positions already open when TP is enabled must also be eligible.
+        eng = self._eng(active_timeframe="5m", take_profit_usd=2.0)
+        st = eng.load()
+        st["balance"] = 999.975
+        st["fees_paid"] = 0.025
+        st["positions"]["OLDUSDT"] = {
+            "symbol": "OLDUSDT",
+            "timeframe": "5m",
+            "side": "SHORT",
+            "qty": 5.0,
+            "entry": 10.0,
+            "notional": 50.0,
+            "margin": 50.0,
+            "entry_fee": 0.025,
+            "opened_at_utc": "2026-11-18T00:00:00Z",
+            "opened_at_wib": "2026-11-18 07:00:00 Asia/Jakarta",
+        }
+        eng.save(st)
+        pos = eng.load()["positions"]["OLDUSDT"]
+        tp = eng._take_profit_price(eng.load(), pos)
+        recs = eng.check_take_profits({"OLDUSDT": tp + 0.001})  # short: above TP is not yet filled
+        self.assertEqual(recs, [])
+        recs = eng.check_take_profits({"OLDUSDT": tp})
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["reason"], "take_profit")
+        self.assertAlmostEqual(recs[0]["pnl"], 2.0, places=9)
+        self.assertNotIn("OLDUSDT", eng.load()["positions"])
 
 
 if __name__ == "__main__":

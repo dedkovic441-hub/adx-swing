@@ -59,10 +59,13 @@ poll_interval_sec: 15
 
 # Paper accounts trade only this timeframe, with one open position per coin.
 # Signals on other timeframes are still alerted and logged, but do not trade.
-# An opposite-direction signal on this timeframe closes the open trade and flips.
-# Positions are not closed on fade, timeout, stop, or take-profit.
+# An open trade closes at +take_profit_usd net (after 0.05% taker fees on both
+# sides) or on an opposite-direction signal, whichever happens first. A
+# take-profit just closes the position; it does not flip. Fade, timeout,
+# and stop never close a position.
 paper:
   active_timeframe: 15m
+  take_profit_usd: 2
 
 # Unconfirmed paper account: a faded BUY?/SELL? keeps the position open.
 # A later same-direction unconfirmed signal adds another leg sized to the

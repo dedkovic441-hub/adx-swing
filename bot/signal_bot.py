@@ -218,6 +218,7 @@ def load_config(path: Optional[Path]) -> dict:
         "unconfirmed_dca_every_signal_timeframes": paper_engine.load_unconfirmed_dca_timeframes(path),
         "unconfirmed_max_add_positions": paper_engine.load_unconfirmed_max_add(path),
         "paper_active_timeframe": paper_engine.load_active_timeframe(path),
+        "paper_take_profit_usd": paper_engine.load_take_profit_usd(path),
     })
     return cfg
 
@@ -800,6 +801,58 @@ class SignalBot:
                     rec.get("entry"), rec.get("exit"), float(rec.get("pnl") or 0), rec.get("reason"),
                 )
 
+    def _check_paper_tp(self, symbol: str, bar: dict) -> None:
+        """Intrabar TP check using this kline's high/low/close. Fill at exact TP."""
+        try:
+            recs = paper_engine.check_price(
+                symbol,
+                high=bar.get("high"),
+                low=bar.get("low"),
+                last=bar.get("close"),
+                bar_open_ts=bar.get("time"),
+            )
+            for rec in recs:
+                log.info(
+                    "paper take_profit %s %s %s entry=%s exit=%s pnl=%.5f",
+                    rec.get("symbol"), rec.get("timeframe"), rec.get("side"),
+                    rec.get("entry"), rec.get("exit"), float(rec.get("pnl") or 0),
+                )
+        except Exception as e:
+            log.error("paper take-profit check failed %s: %s", symbol, e)
+
+    def check_paper_take_profits(self, prices: Optional[dict] = None) -> list[dict]:
+        """Startup / fallback TP sweep against public mark prices (no API keys)."""
+        if prices is None:
+            prices = self.collect_mark_prices()
+        try:
+            recs = paper_engine.check_all_take_profits(prices)
+        except Exception as e:
+            log.error("paper take-profit sweep failed: %s", e)
+            return []
+        for rec in recs:
+            log.info(
+                "paper take_profit %s %s %s entry=%s exit=%s pnl=%.5f",
+                rec.get("symbol"), rec.get("timeframe"), rec.get("side"),
+                rec.get("entry"), rec.get("exit"), float(rec.get("pnl") or 0),
+            )
+        if recs:
+            log.info("paper take-profit sweep closed %s position(s)", len(recs))
+        return recs
+
+    def _sweep_paper_tp_from_candles(self) -> None:
+        """Use the latest in-memory kline per symbol (prefer the active paper TF)."""
+        active = str(self.cfg.get("paper_active_timeframe") or paper_engine.DEFAULT_ACTIVE_TIMEFRAME).lower()
+        latest: dict[str, tuple[str, dict]] = {}
+        for (sym, tf), mkt in list(self.markets.items()):
+            if not mkt.candles:
+                continue
+            bar = mkt.candles[-1]
+            prev = latest.get(sym)
+            if prev is None or (tf == active and prev[0] != active):
+                latest[sym] = (tf, bar)
+        for sym, (_tf, bar) in latest.items():
+            self._check_paper_tp(sym, bar)
+
     def ensure_market(self, symbol: str, tf: str) -> Market:
         key = (symbol, tf)
         if key not in self.markets:
@@ -981,9 +1034,12 @@ class SignalBot:
                 "closed candle %s %s %s close=%s lag=%.1fs source=ws",
                 symbol, tf, fmt_jakarta(bar["time"]), fmt_price(bar["close"]), lag,
             )
+        self._check_paper_tp(symbol, bar)
         pack = mkt.upsert(bar, closed)
         if pack:
             self.on_pack(mkt, pack, True)
+            # A same-bar DCA add can move the average so current prices now hit TP.
+            self._check_paper_tp(symbol, bar)
 
     def _apply_closed_bars(self, mkt: Market, candles: list[dict], source: str) -> None:
         """Apply REST catch-up bars in order, filling any gap since the last seed."""
@@ -1003,9 +1059,11 @@ class SignalBot:
                     "closed candle %s %s %s close=%s lag=%.1fs source=%s",
                     mkt.symbol, mkt.tf, fmt_jakarta(bar["time"]), fmt_price(bar["close"]), lag, source,
                 )
+            self._check_paper_tp(mkt.symbol, bar)
             pack = mkt.upsert(bar, closed)
             if pack:
                 self.on_pack(mkt, pack, True)
+                self._check_paper_tp(mkt.symbol, bar)
 
     async def connect_ws_loop(self) -> None:
         # Wait until markets exist, then run one self-healing socket per
@@ -1126,6 +1184,22 @@ class SignalBot:
                     missing = max(1, int((last_open - have) / interval) if have else 1)
                     jobs.append((sym, tf, min(200, missing + 2)))
                 await self._catchup_due(jobs)
+            # Intrabar TP: prefer live/forming candles; fall back to marks if WS is quiet.
+            last_sweep = getattr(self, "_last_tp_sweep", 0.0)
+            if now - last_sweep >= 5:
+                self._last_tp_sweep = now
+                try:
+                    self._sweep_paper_tp_from_candles()
+                except Exception as e:
+                    log.error("paper take-profit candle sweep failed: %s", e)
+            last_marks = getattr(self, "_last_tp_marks", 0.0)
+            ws_quiet = (not self.ws_ok) or (self._ws_kline_at and now - self._ws_kline_at > 10) or (not self._ws_kline_at)
+            if ws_quiet and now - last_marks >= 15:
+                self._last_tp_marks = now
+                try:
+                    self.check_paper_take_profits()
+                except Exception as e:
+                    log.error("paper take-profit mark sweep failed: %s", e)
             try:
                 await asyncio.wait_for(self.stop.wait(), timeout=0.5)
             except asyncio.TimeoutError:
@@ -1185,12 +1259,13 @@ class SignalBot:
 
     async def run(self) -> None:
         log.info(
-            "coin-chart signal bot starting  market=USD-M  rest=%s  ws=%s  symbols=%s  tfs=%s  paper_tf=%s  sensitivity=%s  telegram=%s",
+            "coin-chart signal bot starting  market=USD-M  rest=%s  ws=%s  symbols=%s  tfs=%s  paper_tf=%s  paper_tp=%s  sensitivity=%s  telegram=%s",
             REST_BASES[0] + REST_PREFIX,
             WS_HOSTS[0],
             ",".join(self.cfg["symbols"]),
             ",".join(self.cfg["timeframes"]),
             self.cfg.get("paper_active_timeframe") or paper_engine.DEFAULT_ACTIVE_TIMEFRAME,
+            self.cfg.get("paper_take_profit_usd", paper_engine.DEFAULT_TAKE_PROFIT_USD),
             self.cfg["sensitivity"],
             "on" if self.alerter.enabled else "off",
         )
@@ -1200,6 +1275,10 @@ class SignalBot:
             self.migrate_paper_accounts()
         except Exception as e:
             log.error("paper migration failed: %s", e)
+        try:
+            self.check_paper_take_profits()
+        except Exception as e:
+            log.error("paper take-profit startup sweep failed: %s", e)
         # REST catch-up always runs, but only for markets whose last closed
         # bar is missing. Confirmed signals come from WS x=true when frames
         # arrive, otherwise from this catch-up within a few seconds of close.
@@ -1259,6 +1338,10 @@ async def amain(args: argparse.Namespace) -> int:
             bot.migrate_paper_accounts()
         except Exception as e:
             log.error("paper migration failed: %s", e)
+        try:
+            bot.check_paper_take_profits()
+        except Exception as e:
+            log.error("paper take-profit startup sweep failed: %s", e)
         return 0
 
     loop = asyncio.get_running_loop()
