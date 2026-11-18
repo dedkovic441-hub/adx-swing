@@ -20,6 +20,7 @@ _orig_default_state = pe.default_state
 def _fixed_default_state() -> dict:
     st = _orig_default_state()
     st["sizing"] = "fixed"  # legacy tests exercise fixed-notional sizing
+    st["leverage"] = 1.0
     return st
 
 
@@ -37,6 +38,8 @@ def _engine(tmp: Path, **kwargs) -> pe.PaperEngine:
         dca_signal_every=kwargs.get("dca_signal_every", 3),
         active_timeframe=kwargs.get("active_timeframe", None),
         take_profit_usd=kwargs.get("take_profit_usd", 2.0),
+        leverage=kwargs.get("leverage", 1.0),
+        cooldown_minutes=kwargs.get("cooldown_minutes", 0),
     )
 
 
@@ -213,6 +216,8 @@ class UnconfirmedScaleInTests(unittest.TestCase):
             lock_path=self.tmp / "paper.lock",
             scale_in=False,
             active_timeframe=None,
+            leverage=1.0,
+            cooldown_minutes=0,
         )
         conf.on_signal("AKEUSDT", "5m", "SELL", 10.0)
         conf.on_signal("AKEUSDT", "5m", "SELL", 11.0)
@@ -701,6 +706,163 @@ class TakeProfitTests(unittest.TestCase):
         self.assertEqual(recs[0]["reason"], "take_profit")
         self.assertAlmostEqual(recs[0]["pnl"], 2.0, places=9)
         self.assertNotIn("OLDUSDT", eng.load()["positions"])
+
+
+
+
+class LeverageAndCooldownTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _eng(self, **kwargs):
+        kwargs.setdefault("leverage", 3.0)
+        kwargs.setdefault("cooldown_minutes", 3)
+        kwargs.setdefault("active_timeframe", "5m")
+        return _engine(self.tmp, **kwargs)
+
+    def test_load_leverage_and_cooldown_from_yaml(self):
+        cfg = self.tmp / "config.yaml"
+        cfg.write_text("paper:\n  leverage: 3\n  cooldown_minutes: 3\n", encoding="utf-8")
+        self.assertEqual(pe.load_leverage(cfg), 3.0)
+        self.assertEqual(pe.load_cooldown_minutes(cfg), 3.0)
+        cfg.write_text("paper:\n  leverage: 5\n  cooldown_minutes: 0\n", encoding="utf-8")
+        self.assertEqual(pe.load_leverage(cfg), 5.0)
+        self.assertEqual(pe.load_cooldown_minutes(cfg), 0.0)
+        cfg.write_text("symbols: [AKEUSDT]\n", encoding="utf-8")
+        self.assertEqual(pe.load_leverage(cfg), 3.0)
+        self.assertEqual(pe.load_cooldown_minutes(cfg), 3.0)
+        self.assertEqual(pe.load_leverage(self.tmp / "missing.yaml"), 3.0)
+        self.assertEqual(pe.load_cooldown_minutes(self.tmp / "missing.yaml"), 3.0)
+
+    def test_compounding_margin_times_leverage_is_notional(self):
+        eng = self._eng()
+        st = _orig_default_state()
+        st["balance"] = 1200.0
+        st["sizing"] = "compound"
+        st["size_pct"] = 0.05
+        self.assertAlmostEqual(eng._position_margin(st), 60.0)
+        self.assertAlmostEqual(eng._position_notional(st), 180.0)
+        eng.on_signal("LEVUSDT", "5m", "BUY?", 10.0)
+        pos = eng.load()["positions"]["LEVUSDT"]
+        self.assertEqual(pos["leverage"], 3.0)
+        self.assertAlmostEqual(pos["margin"], 1000.0 * 0.05)  # default state starts at 1000
+        self.assertAlmostEqual(pos["notional"], 150.0)
+        self.assertAlmostEqual(pos["qty"], 15.0)
+        self.assertAlmostEqual(pos["entry_fee"], 150.0 * 0.0005)
+        self.assertEqual(eng.load()["leverage"], 3.0)
+
+    def test_tp_and_fees_use_3x_notional(self):
+        eng = self._eng()
+        eng.on_signal("TPLVUSDT", "5m", "BUY?", 10.0)
+        st = eng.load()
+        pos = st["positions"]["TPLVUSDT"]
+        tp = eng._take_profit_price(st, pos)
+        self.assertAlmostEqual(eng._unrealized_pnl(st, pos, tp), 2.0, places=9)
+        # 3x qty means a smaller price move than at 1x (~$50 notional)
+        self.assertLess(tp - 10.0, 0.3)
+        recs = eng.on_price("TPLVUSDT", last=tp, high=tp, low=10.0, bar_open_ts=2_000_000_000)
+        self.assertEqual(recs[0]["reason"], "take_profit")
+        self.assertAlmostEqual(recs[0]["pnl"], 2.0, places=9)
+
+    def test_legacy_position_keeps_first_leg_size_on_dca(self):
+        eng = self._eng(dca_every_signal_timeframes=["5m"], dca_signal_every=1)
+        st = eng.load()
+        st["positions"]["OLDLEVUSDT"] = {
+            "symbol": "OLDLEVUSDT", "timeframe": "5m", "side": "LONG",
+            "qty": 5.0, "entry": 10.0, "notional": 50.0, "margin": 50.0,
+            "entry_fee": 0.025, "first_notional": 50.0,
+            "opened_at_utc": "2026-11-18T00:00:00Z",
+            "opened_at_wib": "2026-11-18 07:00:00 Asia/Jakarta",
+        }
+        eng.save(st)
+        eng.on_signal("OLDLEVUSDT", "5m", "BUY?", 10.0)
+        pos = eng.load()["positions"]["OLDLEVUSDT"]
+        self.assertEqual(pos["leverage"], 1.0)
+        self.assertAlmostEqual(pos["first_notional"], 50.0)
+        self.assertAlmostEqual(pos["notional"], 100.0)
+        self.assertAlmostEqual(pos["margin"], 100.0)
+        self.assertEqual(pos["leg_count"], 2)
+
+    def test_liquidation_long_and_short(self):
+        eng = self._eng()
+        eng.on_signal("LIQLONGUSDT", "5m", "BUY?", 100.0)
+        st = eng.load()
+        pos = st["positions"]["LIQLONGUSDT"]
+        liq = eng._liquidation_price(pos)
+        self.assertAlmostEqual(liq, 100.0 * (1 - 1 / 3 + 0.004))
+        recs = eng.on_price("LIQLONGUSDT", last=liq, low=liq, high=100.0, bar_open_ts=2_000_000_000)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["reason"], "liquidation")
+        self.assertAlmostEqual(recs[0]["exit"], liq)
+        self.assertNotIn("LIQLONGUSDT", eng.load()["positions"])
+
+        eng.on_signal("LIQSHORTUSDT", "5m", "SELL?", 100.0)
+        pos = eng.load()["positions"]["LIQSHORTUSDT"]
+        liq = eng._liquidation_price(pos)
+        self.assertAlmostEqual(liq, 100.0 * (1 + 1 / 3 - 0.004))
+        recs = eng.on_price("LIQSHORTUSDT", last=liq, high=liq, low=100.0, bar_open_ts=2_000_000_000)
+        self.assertEqual(recs[0]["reason"], "liquidation")
+        self.assertAlmostEqual(recs[0]["exit"], liq)
+
+    def test_1x_long_does_not_liquidate_on_modest_dip(self):
+        eng = self._eng(leverage=1.0)
+        eng.on_signal("ONEXUSDT", "5m", "BUY?", 100.0)
+        liq = eng._liquidation_price(eng.load()["positions"]["ONEXUSDT"])
+        self.assertAlmostEqual(liq, 100.0 * 0.004)
+        recs = eng.on_price("ONEXUSDT", last=90.0, low=90.0, high=100.0, bar_open_ts=2_000_000_000)
+        self.assertEqual(recs, [])
+        self.assertIn("ONEXUSDT", eng.load()["positions"])
+
+    def test_opposite_close_does_not_flip_during_cooldown(self):
+        from datetime import datetime, timezone, timedelta
+        eng = self._eng()
+        t0 = datetime(2026, 11, 18, 8, 0, tzinfo=timezone.utc)
+        eng._clock_now = t0
+        eng.on_signal("CDUSDT", "5m", "BUY?", 10.0)
+        self.assertIn("CDUSDT", eng.load()["positions"])
+        eng.on_signal("CDUSDT", "5m", "SELL?", 10.1)
+        st = eng.load()
+        self.assertNotIn("CDUSDT", st["positions"])
+        self.assertEqual(st["closed_count"], 1)
+        close = [t for t in _trades(eng) if t["action"] == "CLOSE"][0]
+        self.assertEqual(close["reason"], "opposite_signal")
+        until = pe._parse_utc(st["cooldowns"]["CDUSDT"]["until_utc"])
+        self.assertEqual(until, t0 + timedelta(minutes=3))
+        # Still in cooldown: entry ignored
+        eng._clock_now = t0 + timedelta(minutes=2, seconds=59)
+        eng.on_signal("CDUSDT", "5m", "SELL?", 10.2)
+        self.assertNotIn("CDUSDT", eng.load()["positions"])
+        # Another coin is unaffected
+        eng.on_signal("OTHERUSDT", "5m", "BUY?", 8.0)
+        self.assertIn("OTHERUSDT", eng.load()["positions"])
+        # After 3 minutes a new signal can open
+        eng._clock_now = t0 + timedelta(minutes=3, seconds=1)
+        eng.on_signal("CDUSDT", "5m", "SELL?", 10.2)
+        pos = eng.load()["positions"]["CDUSDT"]
+        self.assertEqual(pos["side"], "SHORT")
+        self.assertEqual(pos["entry"], 10.2)
+        self.assertEqual(pos["leverage"], 3.0)
+
+    def test_cooldown_persists_across_restart_and_follows_tp(self):
+        from datetime import datetime, timezone, timedelta
+        eng = self._eng()
+        t0 = datetime(2026, 11, 18, 8, 0, tzinfo=timezone.utc)
+        eng._clock_now = t0
+        eng.on_signal("TCDUSDT", "5m", "BUY?", 10.0)
+        tp = eng._take_profit_price(eng.load(), eng.load()["positions"]["TCDUSDT"])
+        recs = eng.on_price("TCDUSDT", last=tp, high=tp, low=10.0, bar_open_ts=2_000_000_000)
+        self.assertEqual(recs[0]["reason"], "take_profit")
+        # Restart
+        eng2 = self._eng()
+        eng2._clock_now = t0 + timedelta(minutes=1)
+        eng2.on_signal("TCDUSDT", "5m", "BUY?", 10.0)
+        self.assertNotIn("TCDUSDT", eng2.load()["positions"])
+        cd = eng2.load()["cooldowns"]["TCDUSDT"]
+        self.assertIn("until_utc", cd)
 
 
 if __name__ == "__main__":

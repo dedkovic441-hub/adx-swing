@@ -220,6 +220,8 @@ def load_config(path: Optional[Path]) -> dict:
         "unconfirmed_dca_signal_every": paper_engine.load_unconfirmed_dca_signal_every(path),
         "paper_active_timeframe": paper_engine.load_active_timeframe(path),
         "paper_take_profit_usd": paper_engine.load_take_profit_usd(path),
+        "paper_leverage": paper_engine.load_leverage(path),
+        "paper_cooldown_minutes": paper_engine.load_cooldown_minutes(path),
     })
     return cfg
 
@@ -814,8 +816,8 @@ class SignalBot:
             )
             for rec in recs:
                 log.info(
-                    "paper take_profit %s %s %s entry=%s exit=%s pnl=%.5f",
-                    rec.get("symbol"), rec.get("timeframe"), rec.get("side"),
+                    "paper %s %s %s %s entry=%s exit=%s pnl=%.5f",
+                    rec.get("reason") or "exit", rec.get("symbol"), rec.get("timeframe"), rec.get("side"),
                     rec.get("entry"), rec.get("exit"), float(rec.get("pnl") or 0),
                 )
         except Exception as e:
@@ -832,12 +834,12 @@ class SignalBot:
             return []
         for rec in recs:
             log.info(
-                "paper take_profit %s %s %s entry=%s exit=%s pnl=%.5f",
-                rec.get("symbol"), rec.get("timeframe"), rec.get("side"),
+                "paper %s %s %s %s entry=%s exit=%s pnl=%.5f",
+                rec.get("reason") or "exit", rec.get("symbol"), rec.get("timeframe"), rec.get("side"),
                 rec.get("entry"), rec.get("exit"), float(rec.get("pnl") or 0),
             )
         if recs:
-            log.info("paper take-profit sweep closed %s position(s)", len(recs))
+            log.info("paper exit sweep closed %s position(s)", len(recs))
         return recs
 
     def _sweep_paper_tp_from_candles(self) -> None:
@@ -1260,13 +1262,15 @@ class SignalBot:
 
     async def run(self) -> None:
         log.info(
-            "coin-chart signal bot starting  market=USD-M  rest=%s  ws=%s  symbols=%s  tfs=%s  paper_tf=%s  paper_tp=%s  dca_every=%s  sensitivity=%s  telegram=%s",
+            "coin-chart signal bot starting  market=USD-M  rest=%s  ws=%s  symbols=%s  tfs=%s  paper_tf=%s  paper_tp=%s  paper_lev=%s  cooldown=%sm  dca_every=%s  sensitivity=%s  telegram=%s",
             REST_BASES[0] + REST_PREFIX,
             WS_HOSTS[0],
             ",".join(self.cfg["symbols"]),
             ",".join(self.cfg["timeframes"]),
             self.cfg.get("paper_active_timeframe") or paper_engine.DEFAULT_ACTIVE_TIMEFRAME,
             self.cfg.get("paper_take_profit_usd", paper_engine.DEFAULT_TAKE_PROFIT_USD),
+            self.cfg.get("paper_leverage", paper_engine.DEFAULT_LEVERAGE),
+            self.cfg.get("paper_cooldown_minutes", paper_engine.DEFAULT_COOLDOWN_MINUTES),
             self.cfg.get("unconfirmed_dca_signal_every", paper_engine.DEFAULT_DCA_SIGNAL_EVERY),
             self.cfg["sensitivity"],
             "on" if self.alerter.enabled else "off",

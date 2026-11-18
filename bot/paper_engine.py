@@ -9,13 +9,21 @@ Each account holds at most one open position per coin, and only signals
 on paper.active_timeframe (default 15m) are traded. Signals on other
 timeframes are still alerted and logged, but do not open, add, or close.
 
-A LONG is closed by a SHORT signal (which realizes PnL and flips into a
-new short) or by a take-profit of paper.take_profit_usd net dollars
-(default +$2 after entry and exit taker fees), whichever happens first.
-A SHORT is closed by a LONG signal (flip) or the same take-profit.
-A take-profit just closes the position; it does not flip. Fade, timeout,
-and stop never close a position. A one-time migration may also close
-leftover positions on a non-active timeframe (reason "timeframe_off").
+New positions use compounding margin equal to size_pct of realized
+balance (default 5%) and notional = margin × paper.leverage (default 3x).
+P&L, taker fees, and the +take_profit_usd net TP are computed on that
+notional. Already-open positions keep the size they were opened with;
+further DCA legs on those positions stay at that first-leg size.
+
+A LONG is closed by a SHORT signal, a take-profit of paper.take_profit_usd
+net dollars (default +$2 after entry and exit taker fees), or a simple
+isolated-style liquidation, whichever happens first. A SHORT is closed by
+a LONG signal, the same take-profit, or liquidation. After any close the
+coin is in cooldown for paper.cooldown_minutes (default 3): no new
+position may open, including the opposite side of a flip. A take-profit
+or liquidation just closes; it does not flip. Fade, timeout, and stop
+never close a position. A one-time migration may also close leftover
+positions on a non-active timeframe (reason "timeframe_off").
 
 Unconfirmed scale-in: if that forming pivot disappears (fades/repaints),
 the open position is kept and marked faded. A later same-direction
@@ -50,8 +58,11 @@ LOCK_PATH = ROOT / "run" / "paper.lock"
 
 STARTING_BALANCE = 1000.0
 NOTIONAL = 50.0
-SIZE_PCT = 0.05  # compounding: each new position = 5% of current balance
-LEVERAGE = 1.0
+SIZE_PCT = 0.05  # compounding: margin per new position = 5% of realized balance
+LEVERAGE = 3.0
+DEFAULT_LEVERAGE = 3.0
+DEFAULT_COOLDOWN_MINUTES = 3
+DEFAULT_MAINTENANCE_MARGIN_RATE = 0.004  # 0.4% isolated-style maintenance
 TAKER_FEE = 0.0005  # 0.05% per side
 DEFAULT_MAX_ADD_POSITIONS = 4
 DEFAULT_DCA_EVERY_SIGNAL_TIMEFRAMES = ("15m",)
@@ -325,6 +336,80 @@ def load_take_profit_usd(config_path: Optional[Path] = None) -> float:
     return DEFAULT_TAKE_PROFIT_USD
 
 
+def load_leverage(config_path: Optional[Path] = None) -> float:
+    """Read paper.leverage from config.yaml; default 3.0. Minimum 1."""
+    try:
+        data, text, path = _load_unconfirmed_yaml(config_path)
+        if not path.exists():
+            return DEFAULT_LEVERAGE
+        raw_val = None
+        if isinstance(data, dict):
+            raw = data.get("paper")
+            if isinstance(raw, dict) and raw.get("leverage") is not None:
+                raw_val = raw.get("leverage")
+            elif data.get("paper_leverage") is not None:
+                raw_val = data.get("paper_leverage")
+            elif data.get("leverage") is not None:
+                raw_val = data.get("leverage")
+        if raw_val is not None:
+            return max(1.0, float(raw_val))
+        in_paper = False
+        for line in text.splitlines():
+            raw = line.split("#", 1)[0]
+            stripped = raw.strip()
+            indent = len(raw) - len(raw.lstrip())
+            if stripped.startswith("paper_leverage:"):
+                return max(1.0, float(stripped.split(":", 1)[1].strip().strip("'\"")))
+            if stripped.rstrip(":") == "paper" or stripped.startswith("paper:"):
+                in_paper = True
+                continue
+            if in_paper:
+                if stripped and indent == 0:
+                    in_paper = False
+                elif stripped.startswith("leverage:"):
+                    return max(1.0, float(stripped.split(":", 1)[1].strip().strip("'\"")))
+    except Exception:
+        pass
+    return DEFAULT_LEVERAGE
+
+
+def load_cooldown_minutes(config_path: Optional[Path] = None) -> float:
+    """Read paper.cooldown_minutes from config.yaml; default 3. 0 disables."""
+    try:
+        data, text, path = _load_unconfirmed_yaml(config_path)
+        if not path.exists():
+            return float(DEFAULT_COOLDOWN_MINUTES)
+        raw_val = None
+        if isinstance(data, dict):
+            raw = data.get("paper")
+            if isinstance(raw, dict) and raw.get("cooldown_minutes") is not None:
+                raw_val = raw.get("cooldown_minutes")
+            elif data.get("paper_cooldown_minutes") is not None:
+                raw_val = data.get("paper_cooldown_minutes")
+            elif data.get("cooldown_minutes") is not None:
+                raw_val = data.get("cooldown_minutes")
+        if raw_val is not None:
+            return max(0.0, float(raw_val))
+        in_paper = False
+        for line in text.splitlines():
+            raw = line.split("#", 1)[0]
+            stripped = raw.strip()
+            indent = len(raw) - len(raw.lstrip())
+            if stripped.startswith("paper_cooldown_minutes:"):
+                return max(0.0, float(stripped.split(":", 1)[1].strip().strip("'\"")))
+            if stripped.rstrip(":") == "paper" or stripped.startswith("paper:"):
+                in_paper = True
+                continue
+            if in_paper:
+                if stripped and indent == 0:
+                    in_paper = False
+                elif stripped.startswith("cooldown_minutes:"):
+                    return max(0.0, float(stripped.split(":", 1)[1].strip().strip("'\"")))
+    except Exception:
+        pass
+    return float(DEFAULT_COOLDOWN_MINUTES)
+
+
 def default_state() -> dict:
     return {
         "starting_balance": STARTING_BALANCE,
@@ -357,6 +442,9 @@ class PaperEngine:
         dca_signal_every: Optional[int] = DEFAULT_DCA_SIGNAL_EVERY,
         active_timeframe: Optional[str] = DEFAULT_ACTIVE_TIMEFRAME,
         take_profit_usd: Optional[float] = DEFAULT_TAKE_PROFIT_USD,
+        leverage: Optional[float] = DEFAULT_LEVERAGE,
+        cooldown_minutes: Optional[float] = DEFAULT_COOLDOWN_MINUTES,
+        maintenance_margin_rate: Optional[float] = DEFAULT_MAINTENANCE_MARGIN_RATE,
     ):
         self.state_path = state_path
         self.trades_path = trades_path
@@ -375,6 +463,27 @@ class PaperEngine:
             self.take_profit_usd = max(0.0, float(take_profit_usd if take_profit_usd is not None else DEFAULT_TAKE_PROFIT_USD))
         except (TypeError, ValueError):
             self.take_profit_usd = DEFAULT_TAKE_PROFIT_USD
+        try:
+            self.leverage = max(1.0, float(leverage if leverage is not None else DEFAULT_LEVERAGE))
+        except (TypeError, ValueError):
+            self.leverage = DEFAULT_LEVERAGE
+        try:
+            self.cooldown_minutes = max(0.0, float(cooldown_minutes if cooldown_minutes is not None else DEFAULT_COOLDOWN_MINUTES))
+        except (TypeError, ValueError):
+            self.cooldown_minutes = float(DEFAULT_COOLDOWN_MINUTES)
+        try:
+            self.maintenance_margin_rate = max(0.0, float(maintenance_margin_rate if maintenance_margin_rate is not None else DEFAULT_MAINTENANCE_MARGIN_RATE))
+        except (TypeError, ValueError):
+            self.maintenance_margin_rate = DEFAULT_MAINTENANCE_MARGIN_RATE
+        self._clock_now: Optional[datetime] = None
+
+    def _clock(self) -> datetime:
+        override = self._clock_now
+        if isinstance(override, datetime):
+            if override.tzinfo is None:
+                return override.replace(tzinfo=timezone.utc)
+            return override
+        return _now_utc()
 
     def _lock_file(self):
         fh = open(self.lock_path, "a+")
@@ -422,10 +531,12 @@ class PaperEngine:
         return default_state()
 
     def save(self, st: dict) -> None:
-        now = _now_utc()
+        now = self._clock()
         st["updated_utc"] = _fmt_utc(now)
         st["updated_wib"] = _fmt_wib(now)
         st["take_profit_usd"] = self.take_profit_usd
+        st["leverage"] = self.leverage
+        st["cooldown_minutes"] = self.cooldown_minutes
         if self.scale_in:
             st["dca_signal_every"] = self.dca_signal_every
         tmp = self.state_path.with_suffix(".json.tmp")
@@ -519,7 +630,7 @@ class PaperEngine:
         try:
             st = self.load()
             st.setdefault("positions", {})
-            now = _now_utc()
+            now = self._clock()
             active = self.active_timeframe
 
             if active:
@@ -601,20 +712,42 @@ class PaperEngine:
         pos.setdefault("faded", False)
         pos.setdefault("fade_count", 0)
         pos.setdefault("dca_signal_count", 0)
+        # Legacy positions (no leverage field) keep 1x sizing.
+        if pos.get("leverage") is None:
+            pos["leverage"] = 1.0
+        try:
+            pos_lev = max(1e-9, float(pos.get("leverage") or 1.0))
+        except (TypeError, ValueError):
+            pos_lev = 1.0
+            pos["leverage"] = 1.0
+        if pos.get("first_margin") is None:
+            first = (pos.get("legs") or [{}])[0] if pos.get("legs") else {}
+            if first.get("margin") is not None:
+                pos["first_margin"] = float(first.get("margin") or 0)
+            else:
+                pos["first_margin"] = float(pos.get("first_notional") or notional) / pos_lev
         return pos
 
-    def _position_notional(self, st: dict) -> float:
-        """Compounding: size_pct of current realized balance; else fixed notional."""
+    def _position_margin(self, st: dict) -> float:
+        """Margin for a new position: size_pct of realized balance if compounding.
+
+        In fixed sizing the historical `notional` field is the 1x size, i.e. the margin.
+        """
         if str(st.get("sizing") or "").lower() == "compound":
             pct = float(st.get("size_pct") or SIZE_PCT)
             return max(0.0, float(st["balance"]) * pct)
         return float(st.get("notional") or NOTIONAL)
 
+    def _position_notional(self, st: dict) -> float:
+        """Notional for a new position: margin × account leverage."""
+        lev = float(self.leverage or 1.0) or 1.0
+        return self._position_margin(st) * lev
+
     def _open(self, st: dict, symbol: str, tf: str, side: str, price: float, now: datetime, reason: str) -> Optional[dict]:
-        notional = self._position_notional(st)
-        lev = float(st.get("leverage") or LEVERAGE) or 1.0
+        lev = float(self.leverage or 1.0) or 1.0
+        margin = self._position_margin(st)
+        notional = margin * lev
         fee_rate = float(st.get("taker_fee") or TAKER_FEE)
-        margin = notional / lev
         fee = notional * fee_rate
         needed = margin + fee
         avail = self._available(st)
@@ -635,11 +768,13 @@ class PaperEngine:
             "notional": notional,
             "margin": margin,
             "entry_fee": fee,
+            "leverage": lev,
             "opened_at_utc": _fmt_utc(now),
             "opened_at_wib": _fmt_wib(now),
         }
         if self.scale_in:
             pos["first_notional"] = notional
+            pos["first_margin"] = margin
             pos["leg_count"] = 1
             pos["faded"] = False
             pos["fade_count"] = 0
@@ -666,6 +801,7 @@ class PaperEngine:
             "fee": fee,
             "notional": notional,
             "margin": margin,
+            "leverage": lev,
             "reason": reason,
             "at_utc": _fmt_utc(now),
             "at_wib": _fmt_wib(now),
@@ -707,9 +843,13 @@ class PaperEngine:
             )
             return None
         first_notional = float(pos.get("first_notional") or NOTIONAL)
-        lev = float(st.get("leverage") or LEVERAGE) or 1.0
+        try:
+            pos_lev = max(1e-9, float(pos.get("leverage") or 1.0))
+        except (TypeError, ValueError):
+            pos_lev = 1.0
+        first_margin = float(pos.get("first_margin") if pos.get("first_margin") is not None else (first_notional / pos_lev))
         fee_rate = float(st.get("taker_fee") or TAKER_FEE)
-        margin = first_notional / lev
+        margin = first_margin
         fee = first_notional * fee_rate
         needed = margin + fee
         avail = self._available(st)
@@ -816,6 +956,8 @@ class PaperEngine:
             "paper CLOSE %s %s %s entry=%s exit=%s pnl=%.5f reason=%s",
             pos["symbol"], pos["timeframe"], side, entry, price, pnl, reason,
         )
+        rec["leverage"] = pos.get("leverage")
+        self._arm_cooldown(st, pos.get("symbol") or "", now, reason)
         return rec
 
 
@@ -905,6 +1047,107 @@ class PaperEngine:
                 return True
         return False
 
+
+    def _position_leverage(self, pos: dict) -> float:
+        try:
+            lev = float(pos.get("leverage") or 0)
+        except (TypeError, ValueError):
+            lev = 0.0
+        return lev if lev > 0 else 1.0
+
+    def _liquidation_price(self, pos: dict) -> Optional[float]:
+        """Isolated-style liq: long entry*(1-1/lev+mmr), short entry*(1+1/lev-mmr)."""
+        try:
+            entry = float(pos.get("entry") or 0)
+        except (TypeError, ValueError):
+            return None
+        lev = self._position_leverage(pos)
+        mmr = float(self.maintenance_margin_rate or 0)
+        if entry <= 0 or lev <= 0:
+            return None
+        side = pos.get("side")
+        if side == "LONG":
+            px = entry * (1.0 - 1.0 / lev + mmr)
+            return px if px > 0 else None
+        if side == "SHORT":
+            px = entry * (1.0 + 1.0 / lev - mmr)
+            return px if px > 0 else None
+        return None
+
+    def _liq_hit(
+        self,
+        pos: dict,
+        liq_price: float,
+        high: Optional[float],
+        low: Optional[float],
+        last: Optional[float],
+        bar_open_ts: Optional[float],
+    ) -> bool:
+        use_wicks = self._bar_allows_wicks(pos, bar_open_ts)
+        side = pos.get("side")
+        if side == "LONG":
+            if use_wicks and low is not None and float(low) <= liq_price:
+                return True
+            if last is not None and float(last) <= liq_price:
+                return True
+        elif side == "SHORT":
+            if use_wicks and high is not None and float(high) >= liq_price:
+                return True
+            if last is not None and float(last) >= liq_price:
+                return True
+        return False
+
+    def _cooldown_key(self, symbol: str) -> str:
+        return str(symbol or "").upper()
+
+    def _cooldown_until(self, st: dict, symbol: str) -> Optional[datetime]:
+        rec = (st.get("cooldowns") or {}).get(self._cooldown_key(symbol))
+        if not rec:
+            return None
+        if isinstance(rec, str):
+            return _parse_utc(rec)
+        if isinstance(rec, dict):
+            return _parse_utc(rec.get("until_utc"))
+        return None
+
+    def _in_cooldown(self, st: dict, symbol: str, now: Optional[datetime] = None) -> bool:
+        if self.cooldown_minutes <= 0:
+            return False
+        until = self._cooldown_until(st, symbol)
+        if until is None:
+            return False
+        now = now or self._clock()
+        return now < until
+
+    def _arm_cooldown(self, st: dict, symbol: str, now: datetime, reason: str) -> None:
+        if self.cooldown_minutes <= 0 or not symbol:
+            return
+        until = now + timedelta(minutes=self.cooldown_minutes)
+        st.setdefault("cooldowns", {})[self._cooldown_key(symbol)] = {
+            "until_utc": _fmt_utc(until),
+            "until_wib": _fmt_wib(until),
+            "reason": reason,
+        }
+
+    def _price_exit(
+        self,
+        st: dict,
+        pos: dict,
+        high: Optional[float],
+        low: Optional[float],
+        last: Optional[float],
+        bar_open_ts: Optional[float],
+        now: datetime,
+    ) -> Optional[dict]:
+        """Liquidation first (if both extremes hit in one bar), then take-profit."""
+        liq_price = self._liquidation_price(pos)
+        if liq_price is not None and self._liq_hit(pos, liq_price, high, low, last, bar_open_ts):
+            return self._close(st, pos, liq_price, now, reason="liquidation")
+        tp_price = self._take_profit_price(st, pos)
+        if tp_price is not None and self._tp_hit(pos, tp_price, high, low, last, bar_open_ts):
+            return self._close(st, pos, tp_price, now, reason="take_profit")
+        return None
+
     def on_price(
         self,
         symbol: str,
@@ -913,15 +1156,13 @@ class PaperEngine:
         last: Optional[float] = None,
         bar_open_ts: Optional[float] = None,
     ) -> list[dict]:
-        """Close the coin's open position at exact TP if this update hits +take_profit_usd net.
+        """Close on liquidation or take-profit if this price update hits either level.
 
-        When the candle opened at or after the last fill, the bar high (longs) or
-        low (shorts) can trigger. Otherwise only `last` (live close / mark) is used,
-        so a pre-entry wick cannot stop the trade out. Fill is always the exact
-        price that yields +take_profit_usd net. No new position is opened.
+        When the candle opened at or after the last fill, bar high/low can trigger.
+        Otherwise only `last` is used. Liquidation fills at the exact liq price;
+        TP fills at the exact +take_profit_usd-net price. If both extremes of the
+        same bar would hit, liquidation wins. No new position is opened.
         """
-        if self.take_profit_usd <= 0:
-            return []
         lock = self._lock_file()
         try:
             st = self.load()
@@ -929,12 +1170,9 @@ class PaperEngine:
             _key, pos = self._find_position(st, symbol)
             if not pos:
                 return []
-            tp_price = self._take_profit_price(st, pos)
-            if tp_price is None:
+            rec = self._price_exit(st, pos, high, low, last, bar_open_ts, self._clock())
+            if not rec:
                 return []
-            if not self._tp_hit(pos, tp_price, high, low, last, bar_open_ts):
-                return []
-            rec = self._close(st, pos, tp_price, _now_utc(), reason="take_profit")
             self.save(st)
             return [rec]
         finally:
@@ -942,15 +1180,15 @@ class PaperEngine:
             lock.close()
 
     def check_take_profits(self, prices: dict[str, float]) -> list[dict]:
-        """Close every open position whose mark/last has reached the net TP. Fill at exact TP."""
-        if self.take_profit_usd <= 0 or not prices:
+        """Close positions whose mark/last has hit liquidation or the net TP."""
+        if not prices:
             return []
         lock = self._lock_file()
         closed_recs: list[dict] = []
         try:
             st = self.load()
             st.setdefault("positions", {})
-            now = _now_utc()
+            now = self._clock()
             for _key, pos in list((st.get("positions") or {}).items()):
                 if not isinstance(pos, dict):
                     continue
@@ -958,12 +1196,9 @@ class PaperEngine:
                 last = self._mark_price(prices, symbol)
                 if last is None:
                     continue
-                tp_price = self._take_profit_price(st, pos)
-                if tp_price is None:
-                    continue
-                if not self._tp_hit(pos, tp_price, high=None, low=None, last=last, bar_open_ts=None):
-                    continue
-                closed_recs.append(self._close(st, pos, tp_price, now, reason="take_profit"))
+                rec = self._price_exit(st, pos, None, None, last, None, now)
+                if rec:
+                    closed_recs.append(rec)
             if closed_recs:
                 self.save(st)
             return closed_recs
@@ -994,7 +1229,7 @@ class PaperEngine:
                     symbol, tf, pos_tf or "?",
                 )
                 return
-            now = _now_utc()
+            now = self._clock()
             if self.scale_in:
                 self._mark_faded(st, pos, price, now)
                 self.save(st)
@@ -1094,7 +1329,7 @@ class PaperEngine:
         try:
             st = self.load()
             st.setdefault("positions", {})
-            now = _now_utc()
+            now = self._clock()
             _key, pos = self._find_position(st, symbol)
             if pos and pos.get("side") == want:
                 if self.scale_in:
@@ -1105,9 +1340,23 @@ class PaperEngine:
                 return
             if pos and pos.get("side") != want:
                 self._close(st, pos, price, now, reason="opposite_signal")
-                self._open(st, symbol, tf, want, price, now, reason="flip")
+                if self._in_cooldown(st, symbol, now):
+                    until = self._cooldown_until(st, symbol)
+                    log.info(
+                        "paper skip open %s %s %s — cooldown until %s",
+                        symbol, tf, want, _fmt_wib(until) if until else "?",
+                    )
+                else:
+                    self._open(st, symbol, tf, want, price, now, reason="flip")
             elif not pos:
-                self._open(st, symbol, tf, want, price, now, reason="signal")
+                if self._in_cooldown(st, symbol, now):
+                    until = self._cooldown_until(st, symbol)
+                    log.info(
+                        "paper skip open %s %s %s — cooldown until %s",
+                        symbol, tf, want, _fmt_wib(until) if until else "?",
+                    )
+                else:
+                    self._open(st, symbol, tf, want, price, now, reason="signal")
             self.save(st)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -1128,6 +1377,8 @@ def get_engine() -> PaperEngine:
         _ENGINE = PaperEngine(
             active_timeframe=load_active_timeframe(),
             take_profit_usd=load_take_profit_usd(),
+            leverage=load_leverage(),
+            cooldown_minutes=load_cooldown_minutes(),
         )
     return _ENGINE
 
@@ -1145,6 +1396,8 @@ def get_unconfirmed_engine() -> PaperEngine:
             dca_signal_every=load_unconfirmed_dca_signal_every(),
             active_timeframe=load_active_timeframe(),
             take_profit_usd=load_take_profit_usd(),
+            leverage=load_leverage(),
+            cooldown_minutes=load_cooldown_minutes(),
         )
     return _UNCONF_ENGINE
 

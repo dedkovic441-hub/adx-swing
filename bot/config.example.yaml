@@ -59,13 +59,17 @@ poll_interval_sec: 15
 
 # Paper accounts trade only this timeframe, with one open position per coin.
 # Signals on other timeframes are still alerted and logged, but do not trade.
-# An open trade closes at +take_profit_usd net (after 0.05% taker fees on both
-# sides) or on an opposite-direction signal, whichever happens first. A
-# take-profit just closes the position; it does not flip. Fade, timeout,
-# and stop never close a position.
+# Compounding: margin per new position is 5% of realized balance, notional is
+# margin x leverage. An open trade closes at +take_profit_usd net (after 0.05%
+# taker fees on both sides), on an opposite-direction signal, or on isolated
+# liquidation, whichever happens first. After any close, that coin cannot open
+# a new position for cooldown_minutes (including a flip). A take-profit or
+# liquidation just closes; it does not flip.
 paper:
   active_timeframe: 15m
   take_profit_usd: 2
+  leverage: 3
+  cooldown_minutes: 3
 
 # Unconfirmed paper account: a faded BUY?/SELL? keeps the position open.
 # A later same-direction unconfirmed signal can add another leg sized to
